@@ -21,7 +21,7 @@ export class CodeExecutor {
     const { cwd, signal, onUpdate } = options;
 
     // Get all available tools
-    const allTools = this.toolRegistry.getAllTools();
+    const allTools = this.toolRegistry.getAllTools(cwd);
     const toolsMap = new Map(allTools.map((t) => [t.name, t]));
 
     // Generate Python wrapper functions for all tools
