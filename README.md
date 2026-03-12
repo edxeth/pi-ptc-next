@@ -1,8 +1,35 @@
-# Programmatic Tool Calling (PTC) for pi
+# pi-ptc-next
 
-`pi-ptc` adds a provider-agnostic `code_execution` tool to pi. The model writes Python code, Python calls local pi tools through an internal RPC bridge, and only the final Python output is returned to the model context.
+`pi-ptc-next` adds a provider-agnostic `code_execution` tool to pi. The model writes Python code, Python calls local pi tools through an internal RPC bridge, and only the final Python output is returned to the model context.
 
 This is **not** Anthropic's provider-native PTC wire protocol. Instead, it implements the same core local behavior in a way that can work across multiple labs and models such as GPT-5.4, GLM-5, and Claude-class models.
+
+## Fork history and credits
+
+This repository started from the original [`cegersdoerfer/pi-ptc`](https://github.com/cegersdoerfer/pi-ptc) by [@cegersdoerfer](https://github.com/cegersdoerfer) (Chris Egersdoerfer).
+
+This fork exists because I wanted to keep pushing the extension toward a more provider-agnostic and production-ready local PTC implementation for pi instead of a Claude-leaning prototype.
+
+The main work done here includes:
+
+- refactoring the codebase into clearer execution, contract, and tool submodules
+- replacing the split loader/watcher flow with an authoritative custom tool manager
+- tightening the runtime protocol and execution error boundaries
+- making subprocess execution explicit opt-in and improving Docker behavior
+- adding direct behavioral tests for the core execution/runtime/tooling paths
+- improving package loading, vendoring local reference material for PTC/advanced tool use, and benchmarking real pi usage
+
+If you are looking for the original version or the starting point for this fork, please see the upstream repository above.
+
+## Installation
+
+Install directly from GitHub:
+
+```bash
+pi install git:github.com/edxeth/pi-ptc-next
+```
+
+This fork is published publicly as **pi-ptc-next** to distinguish it from the original `pi-ptc` repository while preserving clear attribution to Chris Egersdoerfer's upstream work.
 
 ## Why this exists
 
