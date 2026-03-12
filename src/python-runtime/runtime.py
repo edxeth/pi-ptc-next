@@ -1,87 +1,122 @@
 import asyncio
 import json
+import os
 import sys
 import traceback
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Iterable, Sequence
 
-# Global state for execution tracking
 _current_line = 0
-_total_lines = 0
-_user_main_code = None
 
 def _trace_lines(frame, event, arg):
     """
-    Trace function to track line-by-line execution of user code
-
-    This function is called by sys.settrace() for each line executed.
-    It sends execution_progress messages to show which line is currently running.
+    Trace function to track line-by-line execution of user code.
     """
     global _current_line
 
-    # Only track 'line' events (not 'call', 'return', 'exception')
-    if event != 'line':
+    if event != "line":
         return _trace_lines
 
-    # Only track lines inside the user_main function
-    if frame.f_code.co_name == 'user_main':
+    if frame.f_code.co_name == "user_main":
         lineno = frame.f_lineno
         _current_line = lineno
-
-        # Send execution progress update
-        # Note: total_lines is set to 0 here, will be calculated on TypeScript side
         try:
-            update = {
-                "type": "execution_progress",
-                "line": lineno,
-                "total_lines": 0
-            }
-            print(json.dumps(update), flush=True)
+            print(json.dumps({"type": "execution_progress", "line": lineno, "total_lines": 0}), flush=True)
         except Exception:
-            # Don't let trace errors break execution
             pass
 
     return _trace_lines
 
+class _PtcHelpers:
+    def __init__(self, max_parallel_tool_calls: int):
+        self.max_parallel_tool_calls = max(1, max_parallel_tool_calls)
+
+    async def gather_limit(self, coroutines: Iterable[Coroutine[Any, Any, Any]], limit: int | None = None):
+        semaphore = asyncio.Semaphore(max(1, limit or self.max_parallel_tool_calls))
+
+        async def _runner(coro: Coroutine[Any, Any, Any]):
+            async with semaphore:
+                return await coro
+
+        return await asyncio.gather(*[_runner(coro) for coro in coroutines])
+
+    async def find_files(self, pattern: str, path: str = ".", limit: int = 1000) -> Sequence[str]:
+        return await glob(pattern=pattern, path=path, limit=limit)
+
+    async def find_files_abs(self, pattern: str, path: str = ".", limit: int = 1000) -> Sequence[str]:
+        files = await self.find_files(pattern=pattern, path=path, limit=limit)
+        base_path = os.path.abspath(path)
+        return [item if os.path.isabs(item) else os.path.join(base_path, item) for item in files]
+
+    async def read_text(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        return await read(path=path, offset=offset, limit=limit)
+
+    async def read_many(
+        self,
+        paths: Sequence[str],
+        limit: int | None = None,
+        offset: int | None = None,
+        line_limit: int | None = None,
+    ) -> Sequence[str]:
+        return await self.gather_limit(
+            [read(path=path, offset=offset, limit=line_limit) for path in paths],
+            limit=limit,
+        )
+
+    async def read_tree(
+        self,
+        pattern: str,
+        path: str = ".",
+        limit: int = 1000,
+        concurrency: int | None = None,
+        offset: int | None = None,
+        line_limit: int | None = None,
+    ) -> Sequence[dict[str, Any]]:
+        files = await self.find_files_abs(pattern=pattern, path=path, limit=limit)
+        contents = await self.read_many(files, limit=concurrency, offset=offset, line_limit=line_limit)
+        return [
+            {
+                "path": file_path,
+                "content": content,
+            }
+            for file_path, content in zip(files, contents)
+        ]
+
+    def json_dump(self, value: Any) -> str:
+        return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+
+ptc = _PtcHelpers(globals().get("PTC_MAX_PARALLEL_TOOL_CALLS", 8))
+
+def _stringify_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, tuple, bool, int, float)):
+        return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
 async def _runtime_main(user_main: Callable[[], Coroutine[Any, Any, Any]]):
     """
-    Runtime entry point that executes user code with RPC support
-
-    Args:
-        user_main: User's async main function to execute
+    Runtime entry point that executes user code with RPC support.
     """
     try:
-        # Start stdin reader for RPC responses
         await _rpc.start_reader()
-
-        # Install line tracer before execution
         sys.settrace(_trace_lines)
-
-        # Execute user's main function
         output = await user_main()
-
-        # Remove tracer after successful execution
         sys.settrace(None)
-
-        # Send completion message
-        result = {
-            "type": "complete",
-            "output": str(output) if output is not None else ""
-        }
-        print(json.dumps(result), flush=True)
-
-    except Exception as e:
-        # Ensure tracer is removed on error
+        print(json.dumps({"type": "complete", "output": _stringify_output(output)}), flush=True)
+    except Exception as error:
         sys.settrace(None)
-
-        # Send error message
-        error_msg = {
-            "type": "error",
-            "message": str(e),
-            "traceback": traceback.format_exc()
-        }
-        print(json.dumps(error_msg), flush=True)
+        print(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+            ),
+            flush=True,
+        )
         sys.exit(1)
-
     finally:
-        # Cleanup RPC client
         await _rpc.cleanup()

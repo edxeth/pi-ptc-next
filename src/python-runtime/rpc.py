@@ -1,22 +1,22 @@
 import asyncio
 import json
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, Optional
 
 class RpcClient:
-    """RPC client for calling tools from Python code"""
+    """RPC client for calling tools from Python code."""
 
     def __init__(self):
         self.call_id = 0
-        self.pending_calls: Dict[str, asyncio.Future] = {}
-        self.reader_task: Optional[asyncio.Task] = None
+        self.pending_calls: Dict[str, asyncio.Future[Any]] = {}
+        self.reader_task: Optional[asyncio.Task[Any]] = None
 
-    async def start_reader(self):
-        """Start background task to read responses from stdin"""
+    async def start_reader(self) -> None:
+        """Start background task to read responses from stdin."""
         self.reader_task = asyncio.create_task(self._stdin_reader())
 
-    async def _stdin_reader(self):
-        """Read responses from stdin and dispatch to pending calls"""
+    async def _stdin_reader(self) -> None:
+        """Read responses from stdin and dispatch them to pending calls."""
         try:
             loop = asyncio.get_event_loop()
             reader = asyncio.StreamReader()
@@ -31,17 +31,16 @@ class RpcClient:
                 try:
                     response = json.loads(line.decode().strip())
                     self._handle_response(response)
-                except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {e}", file=sys.stderr)
-                except Exception as e:
-                    print(f"Error handling response: {e}", file=sys.stderr)
+                except json.JSONDecodeError as error:
+                    print(f"JSON decode error: {error}", file=sys.stderr)
+                except Exception as error:
+                    print(f"Error handling response: {error}", file=sys.stderr)
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            print(f"stdin reader error: {e}", file=sys.stderr)
+        except Exception as error:
+            print(f"stdin reader error: {error}", file=sys.stderr)
 
-    def _handle_response(self, response: dict):
-        """Called when stdin receives a response"""
+    def _handle_response(self, response: Dict[str, Any]) -> None:
         call_id = response.get("id")
         if call_id and call_id in self.pending_calls:
             future = self.pending_calls[call_id]
@@ -49,37 +48,31 @@ class RpcClient:
                 if response.get("error"):
                     future.set_exception(Exception(response["error"]))
                 else:
-                    future.set_result(response.get("content", []))
+                    future.set_result(response.get("value"))
             del self.pending_calls[call_id]
 
-    async def call(self, tool: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Call a tool via RPC and wait for the result"""
+    async def call(self, tool: str, params: Dict[str, Any]) -> Any:
         self.call_id += 1
         call_id = f"call_{self.call_id}"
-
-        # Send request to stdout
         request = {
             "type": "tool_call",
             "id": call_id,
             "tool": tool,
-            "params": params
+            "params": params,
         }
         print(json.dumps(request), flush=True)
 
-        # Wait for response
-        future = asyncio.Future()
+        future: asyncio.Future[Any] = asyncio.Future()
         self.pending_calls[call_id] = future
 
         try:
-            result = await asyncio.wait_for(future, timeout=300.0)  # 5 minute timeout
-            return result
-        except asyncio.TimeoutError:
+            return await asyncio.wait_for(future, timeout=300.0)
+        except asyncio.TimeoutError as error:
             if call_id in self.pending_calls:
                 del self.pending_calls[call_id]
-            raise Exception(f"Tool call '{tool}' timed out")
+            raise Exception(f"Tool call '{tool}' timed out") from error
 
-    async def cleanup(self):
-        """Clean up resources"""
+    async def cleanup(self) -> None:
         if self.reader_task:
             self.reader_task.cancel()
             try:
@@ -87,9 +80,8 @@ class RpcClient:
             except asyncio.CancelledError:
                 pass
 
-# Global RPC client instance
 _rpc = RpcClient()
 
-async def _rpc_call(tool: str, params: dict):
-    """Call a tool via RPC (used by generated wrapper functions)"""
+async def _rpc_call(tool: str, params: Dict[str, Any]) -> Any:
+    """Call a tool via RPC and return the JSON-compatible normalized value."""
     return await _rpc.call(tool, params)

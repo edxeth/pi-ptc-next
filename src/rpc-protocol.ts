@@ -1,88 +1,121 @@
 import { ChildProcess } from "child_process";
 import readline from "readline";
 import type { AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
-import type { RpcMessage, ToolInfo } from "./types";
+import { normalizeToolResult } from "./tool-adapters";
+import { estimateTokensFromChars } from "./utils";
+import type { CodeExecutionResult, ExecutionDetails, RpcMessage, ToolInfo } from "./types";
 
-type ExecuteTool = (toolName: string, params: any) => Promise<any>;
+type ExecuteTool = (toolName: string, params: unknown, nestedCallId: string) => Promise<unknown>;
 
-/**
- * RPC protocol handler for communicating with Python runtime
- */
 export class RpcProtocol {
   private lineReader: readline.Interface;
-  private completionPromise: Promise<string>;
-  private completionResolve!: (value: string) => void;
+  private completionPromise: Promise<CodeExecutionResult>;
+  private completionResolve!: (value: CodeExecutionResult) => void;
   private completionReject!: (error: Error) => void;
   private stderr = "";
-  private stdout = ""; // Capture non-JSON stdout (print statements)
-  private currentLine = 0;
-  private userCodeLines: string[] = [];
+  private stdout = "";
+  private userCodeLines: string[];
+  private completed = false;
+  private startedAt = Date.now();
+  private nestedToolCalls = 0;
+  private nestedToolNames: string[] = [];
+  private nestedResultChars = 0;
+  private nestedResultCount = 0;
+  private nestedErrors = 0;
 
   constructor(
     private proc: ChildProcess,
     private tools: Map<string, ToolInfo>,
     private executeTool: ExecuteTool,
-    private userCode: string,
+    userCode: string,
     private signal?: AbortSignal,
-    private onUpdate?: AgentToolUpdateCallback<any>
+    private onUpdate?: AgentToolUpdateCallback<unknown>
   ) {
-    // Store user code lines for display
     this.userCodeLines = userCode.split("\n");
-    // Set up line reader for stdout
     this.lineReader = readline.createInterface({
       input: proc.stdout!,
       crlfDelay: Infinity,
     });
 
-    // Create completion promise
     this.completionPromise = new Promise((resolve, reject) => {
       this.completionResolve = resolve;
       this.completionReject = reject;
     });
 
-    // Handle stdout lines (RPC messages)
     this.lineReader.on("line", (line) => {
-      this.handleMessage(line);
+      void this.handleMessage(line);
     });
 
-    // Capture stderr
     proc.stderr?.on("data", (data) => {
       this.stderr += data.toString();
     });
 
-    // Handle process exit
-    proc.on("exit", (code, signal_name) => {
+    proc.on("exit", (code) => {
+      if (this.completed) {
+        return;
+      }
+
       if (code !== 0 && code !== null) {
         const errorMsg = this.stderr || `Process exited with code ${code}`;
-        this.completionReject(new Error(errorMsg));
+        this.rejectOnce(new Error(errorMsg));
       }
     });
 
-    // Handle process errors
     proc.on("error", (err) => {
-      this.completionReject(new Error(`Process error: ${err.message}`));
+      this.rejectOnce(new Error(`Process error: ${err.message}`));
     });
 
-    // Handle abort signal
     if (signal) {
       signal.addEventListener(
         "abort",
         () => {
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (proc.exitCode === null) {
-              proc.kill("SIGKILL");
-            }
-          }, 5000);
-          this.completionReject(new Error("Execution aborted"));
+          this.killProcess();
+          this.rejectOnce(new Error("Execution aborted"));
         },
         { once: true }
       );
     }
   }
 
+  private killProcess(): void {
+    this.proc.kill("SIGTERM");
+    setTimeout(() => {
+      if (this.proc.exitCode === null) {
+        this.proc.kill("SIGKILL");
+      }
+    }, 5000);
+  }
+
+  private resolveOnce(result: CodeExecutionResult): void {
+    if (this.completed) {
+      return;
+    }
+    this.completed = true;
+    this.completionResolve(result);
+  }
+
+  private rejectOnce(error: Error): void {
+    if (this.completed) {
+      return;
+    }
+    this.completed = true;
+    this.completionReject(error);
+  }
+
+  private buildExecutionDetails(overrides?: Partial<ExecutionDetails>): ExecutionDetails {
+    return {
+      nestedToolCalls: this.nestedToolCalls,
+      nestedToolNames: [...this.nestedToolNames],
+      nestedResultChars: this.nestedResultChars,
+      nestedResultCount: this.nestedResultCount,
+      nestedErrors: this.nestedErrors,
+      durationMs: Date.now() - this.startedAt,
+      estimatedAvoidedTokens: estimateTokensFromChars(this.nestedResultChars),
+      ...overrides,
+    };
+  }
+
   private async handleMessage(line: string): Promise<void> {
-    // Try to parse as JSON RPC message
     try {
       const msg = JSON.parse(line) as RpcMessage;
 
@@ -92,7 +125,6 @@ export class RpcProtocol {
           break;
 
         case "execution_progress":
-          this.currentLine = msg.line;
           if (this.onUpdate) {
             this.onUpdate({
               content: [
@@ -101,74 +133,81 @@ export class RpcProtocol {
                   text: `Executing line ${msg.line}/${this.userCodeLines.length}`,
                 },
               ],
-              details: {
+              details: this.buildExecutionDetails({
                 currentLine: msg.line,
                 totalLines: this.userCodeLines.length,
                 userCode: this.userCodeLines,
-              },
+              }),
             });
           }
           break;
 
-        case "complete":
-          // Prepend any captured print statements to the output
-          const finalOutput = this.stdout ? this.stdout + "\n" + msg.output : msg.output;
-          this.completionResolve(finalOutput);
+        case "complete": {
+          const finalOutput = this.stdout ? `${this.stdout}\n${msg.output}`.trim() : msg.output;
+          this.resolveOnce({
+            output: finalOutput,
+            details: this.buildExecutionDetails(),
+          });
           break;
+        }
 
-        case "error":
-          const errorMsg = msg.message + (msg.traceback ? "\n" + msg.traceback : "");
-          this.completionReject(new Error(errorMsg));
+        case "error": {
+          const errorMessage = msg.message + (msg.traceback ? `\n${msg.traceback}` : "");
+          this.rejectOnce(new Error(errorMessage));
           break;
+        }
 
         case "update":
           if (this.onUpdate) {
-            // Call onUpdate with a partial result
             this.onUpdate({
               content: [{ type: "text", text: msg.message }],
-              details: undefined,
+              details: this.buildExecutionDetails(),
             });
           }
           break;
       }
-    } catch (err) {
-      // Not a JSON message - likely a print statement
-      // Collect it as stdout
+    } catch {
       if (this.stdout) {
-        this.stdout += "\n" + line;
+        this.stdout += `\n${line}`;
       } else {
         this.stdout = line;
       }
     }
   }
 
-  private async handleToolCall(msg: {
-    id: string;
-    tool: string;
-    params: any;
-  }): Promise<void> {
+  private async handleToolCall(msg: Extract<RpcMessage, { type: "tool_call" }>): Promise<void> {
+    this.nestedToolCalls += 1;
+    this.nestedToolNames.push(msg.tool);
+
+    if (this.onUpdate) {
+      this.onUpdate({
+        content: [{ type: "text", text: `Calling ${msg.tool}()` }],
+        details: this.buildExecutionDetails(),
+      });
+    }
+
     try {
       const toolInfo = this.tools.get(msg.tool);
       if (!toolInfo) {
         throw new Error(`Unknown tool: ${msg.tool}`);
       }
 
-      // Execute the actual tool
-      const result = await this.executeTool(msg.tool, msg.params);
+      const result = await this.executeTool(msg.tool, msg.params, msg.id);
+      const normalized = normalizeToolResult(msg.tool, result as { content?: Array<Record<string, unknown>>; details?: unknown });
+      this.nestedResultCount += 1;
+      this.nestedResultChars += normalized.estimatedChars;
 
-      // Send result back to Python
       this.send({
         type: "tool_result",
         id: msg.id,
-        content: result.content || [],
+        value: normalized.value,
       });
-    } catch (err) {
-      // Send error back to Python
+    } catch (error) {
+      this.nestedErrors += 1;
       this.send({
         type: "tool_result",
         id: msg.id,
-        content: [],
-        error: err instanceof Error ? err.message : String(err),
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   }
@@ -179,7 +218,7 @@ export class RpcProtocol {
     }
   }
 
-  async waitForCompletion(): Promise<string> {
+  async waitForCompletion(): Promise<CodeExecutionResult> {
     return this.completionPromise;
   }
 }

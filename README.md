@@ -1,350 +1,297 @@
-# Programmatic Tool Calling (PTC) Extension for pi-coding-agent
+# Programmatic Tool Calling (PTC) for pi
 
-An extension for [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) that enables Claude to write Python code that calls tools as async functions, dramatically reducing token usage and latency for multi-tool workflows.
+`pi-ptc` adds a provider-agnostic `code_execution` tool to pi. The model writes Python code, Python calls local pi tools through an internal RPC bridge, and only the final Python output is returned to the model context.
 
-## Quick Start
+This is **not** Anthropic's provider-native PTC wire protocol. Instead, it implements the same core local behavior in a way that can work across multiple labs and models such as GPT-5.4, GLM-5, and Claude-class models.
 
-```bash
-git clone <this-repo> pi_PTC
-cd pi_PTC
-npm install
-npm run build
+## Why this exists
 
-# Link as a global extension
-mkdir -p ~/.pi/agent/extensions
-ln -s "$(pwd)" ~/.pi/agent/extensions/ptc
-```
+Without PTC, multi-step tool use usually looks like this:
 
-Restart pi-coding-agent. The `code_execution` tool is now available.
+1. Model calls a tool
+2. Tool result comes back into the conversation
+3. Model reasons over that result in-context
+4. Repeat for every additional tool call
 
-## Overview
+That is expensive for large intermediate results.
 
-**Problem**: Normally, when Claude needs to use multiple tools in sequence, each tool call requires a round-trip through the LLM:
-1. Claude calls tool → returns result → Claude processes in context
-2. Repeat for each tool call
-3. All intermediate tool results consume context tokens and add latency
+With `code_execution`, the model can do this instead:
 
-**Solution**: With PTC, Claude writes Python code that calls tools as async functions. The code executes locally with only the final output returned to Claude.
+1. Write Python once
+2. Call tools from Python as async functions
+3. Filter/aggregate/loop locally
+4. Return only the compact final answer
 
-### Benefits
+## What changed in this version
 
-- **Reduced Token Usage**: Intermediate tool results don't consume context
-- **Lower Latency**: Single LLM round-trip instead of multiple
-- **Complex Workflows**: Enable sophisticated multi-tool logic with loops, conditionals, and data aggregation
-- **Optional Isolation**: Docker containers available for additional security (opt-in)
+This implementation now focuses on provider-agnostic reliability:
 
-## Prerequisites
+- Added a real hard execution timeout for the whole Python run
+- Added a `glob()` alias over pi's `find()` behavior for model ergonomics
+- Normalized common built-in tool results into Python-friendly values
+- Excluded `code_execution` from calling itself recursively
+- Added local tool opt-in metadata for custom/extension tools
+- Added nested execution metrics such as nested tool count and estimated avoided tokens
+- Added bounded concurrency helper utilities in Python
+- Added `ptc.read_tree(...)` for deterministic find+read workflows
 
-- Node.js 18+
-- Python 3.12+ (must be available as `python3`)
-- [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) installed
-- Docker (optional, see [Execution Modes](#execution-modes) below)
+## Available Python functions
 
-## Installation
+By default, Python code inside `code_execution` can call a safe built-in subset:
 
-1. Clone and build:
-   ```bash
-   git clone <this-repo> pi_PTC
-   cd pi_PTC
-   npm install
-   npm run build
-   ```
+- `read(path, file_path=None, offset=None, limit=None) -> str`
+- `glob(pattern, path='.', limit=1000) -> list[str]`
+- `find(pattern, path='.', limit=1000) -> list[str]`
+- `grep(...) -> list[dict]`
+- `ls(path='.', limit=500) -> list[str]`
 
-2. Link as a pi-coding-agent extension:
-   ```bash
-   # Option 1: Global extension (all projects)
-   mkdir -p ~/.pi/agent/extensions
-   ln -s /path/to/pi_PTC ~/.pi/agent/extensions/ptc
+Optional tools can be enabled via environment/config policy:
 
-   # Option 2: Project-specific extension
-   mkdir -p /path/to/project/.pi/extensions
-   ln -s /path/to/pi_PTC /path/to/project/.pi/extensions/ptc
-   ```
+- `bash(...) -> dict`
+- `edit(...) -> dict`
+- `write(...) -> dict`
 
-3. Restart pi-coding-agent — the extension will be auto-discovered.
+Custom and extension tools are **not callable from Python by default**. They must explicitly opt in with `ptc.enabled: true`.
 
-## Available Tools
+## Model-facing usage rules
 
-By default, Python code running in PTC has access to pi-coding-agent's **built-in tools only** (e.g. `glob`, `read`, `bash`). Tools from other pi extensions are **not** available — the pi extensions API does not currently support extensions exposing tools to each other.
+The `code_execution` tool is best for:
 
-If you need additional tools available in the PTC environment, you must add them as custom tools in the `tools/` directory. See [Custom Tools](#custom-tools) for details.
+- 3+ dependent tool calls
+- loops, filtering, aggregation, and batching
+- large intermediate results that should stay out of chat history
+- inspecting many files and returning a compact summary
 
-## Usage
+Avoid it for:
 
-Once installed, Claude can use the `code_execution` tool to run Python code with tool calling. Any tool available in the PTC environment — both pi's built-in tools and your [custom tools](#custom-tools) — can be called as an async Python function.
+- one simple tool call
+- workflows where the user explicitly needs every raw intermediate result in the chat transcript
 
-The real power of PTC is orchestrating **custom tools** in ways that would otherwise require many LLM round-trips. Pi's built-in tools (`glob`, `read`, `bash`) are also available but can often be replaced with standard Python.
+Important runtime rules:
 
-### Example: Multi-step API workflow
+- Top-level `await` is already available
+- Do **not** call `asyncio.run(...)`
+- Do **not** call `_rpc_call(...)` directly; use the generated wrappers and `ptc.*` helpers
+- Prefer returning compact JSON or summaries
+- Intermediate tool results stay local unless you explicitly print or return them
 
-Suppose you have custom tools `query_db` and `send_notification` registered in `tools/`:
+## Python helpers
 
-```python
-# Fetch all overdue orders and notify their owners — single LLM round-trip
-orders = await query_db(sql="SELECT id, owner_email FROM orders WHERE due < NOW() AND status = 'pending'")
+The runtime also exposes a `ptc` helper object:
 
-notified = 0
-for order in orders:
-    await send_notification(
-        to=order["owner_email"],
-        subject=f"Order #{order['id']} is overdue",
-        body="Please review your order status."
-    )
-    notified += 1
+- `await ptc.gather_limit(coros, limit=8)`
+- `await ptc.read_many(paths, limit=8, offset=None, line_limit=None)`
+- `await ptc.read_tree(pattern, path='.', limit=1000, concurrency=None, offset=None, line_limit=None)`
+- `await ptc.find_files(pattern, path='.', limit=1000)`
+- `await ptc.find_files_abs(pattern, path='.', limit=1000)`
+- `await ptc.read_text(path, offset=None, limit=None)`
+- `ptc.json_dump(value)`
 
-return f"Notified {notified} owners about overdue orders"
-```
-
-Without PTC, Claude would need a separate LLM round-trip for each `query_db` and `send_notification` call, consuming context tokens on every intermediate result.
-
-### Example: Aggregating results from a custom tool
+Example:
 
 ```python
-# Custom tool "get_weather" registered in tools/
-cities = ["London", "Tokyo", "New York", "Sydney"]
-results = []
-
-for city in cities:
-    weather = await get_weather(location=city)
-    results.append(f"{city}: {weather}")
-
-return "\n".join(results)
+entries = await ptc.read_tree(pattern="**/*.ts", path="src", concurrency=6)
+return {
+    "files": len(entries),
+    "sample_lengths": [len(entry["content"]) for entry in entries[:3]],
+}
 ```
 
-### Example: Mixing custom tools with built-in tools
+## Result normalization
 
-```python
-# Use built-in glob/read to find config, then pass to a custom tool
-config = await read(file_path="deploy.yaml")
-result = await deploy_service(config=config, environment="staging")
-return f"Deploy result: {result}"
+pi tools are normalized before being returned to Python:
+
+- `read` returns a string
+- `find`, `glob`, and `ls` return `list[str]`
+- `grep` returns `list[dict]`
+- `bash`, `edit`, and `write` return dictionaries
+- empty `find`/`ls`/`grep` results become empty lists rather than English sentinel strings
+
+This makes the runtime easier for non-Anthropic models to use reliably.
+
+## Local tool policy
+
+This extension uses a local provider-agnostic equivalent of `allowed_callers`.
+
+### Built-ins
+
+Safe read-only built-ins are callable by default.
+
+### Mutating tools
+
+`bash`, `edit`, and `write` are blocked unless explicitly enabled.
+
+### Custom and extension tools
+
+These must opt in with:
+
+```js
+ptc: {
+  enabled: true,
+  readOnly: true,
+}
 ```
 
-### Example: Conditional logic with custom tools
+## Environment variables
 
-```python
-status = await check_service_health(service="api")
+### Execution
 
-if status["healthy"]:
-    return "All services healthy"
-else:
-    # Restart and re-check
-    await restart_service(service="api")
-    recheck = await check_service_health(service="api")
-    return f"Restarted api — now {'healthy' if recheck['healthy'] else 'still unhealthy'}"
-```
+- `PTC_USE_DOCKER=true` — run Python inside Docker instead of a local subprocess
+- `PTC_EXECUTION_TIMEOUT_MS=270000` — hard timeout for the full Python execution
+- `PTC_MAX_OUTPUT_CHARS=100000` — truncate final output after this many characters
+- `PTC_MAX_PARALLEL_TOOL_CALLS=8` — default concurrency for `ptc.gather_limit()`
 
-## Custom Tools
+### Tool policy
 
-Drop `.js` files in the `tools/` directory to register additional tools. These become available both as direct pi-coding-agent tools and as async functions inside `code_execution` Python code.
+- `PTC_ALLOW_MUTATIONS=true` — allow mutating tools from Python
+- `PTC_ALLOW_BASH=true` — allow `bash` from Python
+- `PTC_CALLABLE_TOOLS=read,glob,find,grep,ls` — explicit allowlist override
+- `PTC_BLOCKED_TOOLS=bash,write` — explicit denylist override
 
-See `tools/get_weather.js.example` for a complete example:
+## How it works
 
-```bash
-cp tools/get_weather.js.example tools/get_weather.js
-```
-
-Each file should default-export an object with:
-
-| Field | Required | Description |
-|---|---|---|
-| `name` | yes | Tool name (becomes the Python function name) |
-| `label` | no | Display label |
-| `description` | yes | Description shown to the model |
-| `parameters` | yes | JSON Schema object describing the tool's parameters |
-| `execute` | yes | `async (toolCallId, params, signal) => result` |
-
-Only `.js` files are loaded — `.ts`, `.example`, etc. are ignored. Files are loaded at extension startup; restart pi-coding-agent after adding new tools.
-
-## How It Works
-
-### Architecture
-
-```
-User: "Analyze all TypeScript files and find bugs"
+```text
+User request
   ↓
-LLM generates Python code:
-  files = await glob(pattern="**/*.ts")
-  for file in files:
-      content = await read(file_path=file)
-      # analyze content...
+Model calls code_execution
   ↓
-code_execution tool called with Python code
+pi-ptc builds Python wrappers for callable tools
   ↓
-Extension:
-  1. Gets available tools from pi-coding-agent
-  2. Generates Python wrapper functions
-  3. Combines wrappers + user code
-  4. Starts Python process (Docker or subprocess)
+Python runtime executes user code
   ↓
-Python Runtime:
-  1. Executes user code
-  2. When calling a tool: sends RPC message to Node.js
-  3. Node.js executes actual tool
-  4. Result returned to Python
-  5. Python continues execution
+Python calls tools over local JSON RPC
   ↓
-Extension returns final output to LLM
+Node executes real pi tools
+  ↓
+Results are normalized into Python-friendly values
+  ↓
+Python returns one compact final output
 ```
 
-### Components
+## Architecture
 
-- **Extension (`src/index.ts`)**: Registers `code_execution` tool
-- **Sandbox Manager (`src/sandbox-manager.ts`)**: Manages Docker containers or Python subprocesses
-- **Code Executor (`src/code-executor.ts`)**: Orchestrates Python code execution
-- **Tool Wrapper Generator (`src/tool-wrapper.ts`)**: Converts tool definitions to Python async functions
-- **RPC Protocol (`src/rpc-protocol.ts` + `src/python-runtime/rpc.py`)**: JSON-based communication between Node.js and Python
-- **Python Runtime (`src/python-runtime/runtime.py`)**: Python execution environment
-- **Tool Loader (`src/tool-loader.ts`)**: Discovers and loads custom tools from `tools/`
+- `src/index.ts` — registers `code_execution` and model guidance
+- `src/code-executor.ts` — execution orchestration and global timeout
+- `src/tool-registry.ts` — tool discovery, policy, and caller metadata
+- `src/tool-adapters.ts` — normalization of pi tool results
+- `src/tool-wrapper.ts` — Python wrapper generation
+- `src/rpc-protocol.ts` — Node-side RPC bridge and nested metrics
+- `src/python-runtime/runtime.py` — Python runtime and helpers
+- `src/python-runtime/rpc.py` — Python-side RPC client
+- `src/tool-loader.ts` / `src/tool-watcher.ts` — custom tool loading and hot reload
 
-### Execution Modes
+## Execution modes
 
-The extension runs Python code in a local subprocess by default. Docker isolation is available as an opt-in feature.
+### Subprocess mode
 
-**Subprocess mode** (default):
+Default mode.
 
-- Spawns a `python3` subprocess in the current working directory
-- No additional isolation beyond subprocess boundaries
-- Simple setup with no external dependencies
-- Suitable for trusted environments where you control the code generation
+- runs `python3 -u -c ...` in the current working directory
+- simplest setup
+- suitable for trusted local use
 
-**Docker mode** (opt-in):
+### Docker mode
 
-To enable Docker isolation, set the environment variable:
+Enable with:
+
 ```bash
 export PTC_USE_DOCKER=true
 ```
 
-Then ensure Docker is installed and running:
-```bash
-# Verify Docker is available
-docker --version
-docker ps
+Behavior:
 
-# Pull the Python image (optional, avoids slow first run)
-docker pull python:3.12-slim
+- uses `python:3.12-slim`
+- disables network access
+- mounts the workspace read-only
+- applies container memory/CPU limits
+- reuses the container for multiple executions during the session
+
+## Execution limits
+
+- Hard timeout: `PTC_EXECUTION_TIMEOUT_MS` (default `270000` ms)
+- Max final output: `PTC_MAX_OUTPUT_CHARS` (default `100000` chars)
+- Per nested tool call timeout: 300 seconds in the Python RPC client
+- Cancellation: abort signals are supported
+
+## Custom tools
+
+Drop `.js` files into `tools/`.
+
+Example:
+
+```js
+export default {
+  name: "query_db",
+  description: "Run a read-only database query",
+  parameters: {
+    type: "object",
+    properties: {
+      sql: { type: "string" },
+    },
+    required: ["sql"],
+  },
+  ptc: {
+    enabled: true,
+    readOnly: true,
+  },
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    return {
+      content: [{ type: "text", text: "Query completed" }],
+      details: {
+        ptcValue: {
+          rows: [],
+          rowCount: 0,
+        },
+      },
+    };
+  },
+};
 ```
 
-When enabled, each execution runs inside a container with:
-- **Network disabled** (`--network none`) — code cannot make outbound requests
-- **Workspace mounted read-only** (`-v "$CWD:/workspace:ro"`)
-- **Resource limits**: 512 MB RAM, 1 CPU
-- **Container reuse**: Same container used for multiple executions within 4.5 minutes
+If `details.ptcValue` is present, that JSON-compatible value is returned directly to Python.
 
-**Note**: Docker isolation provides defense-in-depth but doesn't prevent malicious code from using tools (like `bash`) to affect your system, since tool execution happens on the host via RPC.
+## Hot reload
 
-### Execution Limits
+Custom `.js` tools in `tools/` are watched and hot-reloaded while the session is running.
 
-- **Timeout**: 4.5 minutes (270 seconds)
-- **Max Output**: 100 KB (automatically truncated with notice)
-- **Cancellation**: Supports abort signals (Ctrl+C)
+## Metrics
+
+Completed `code_execution` runs now record local nested execution stats, including:
+
+- nested tool call count
+- nested tool names
+- nested result count
+- nested result character volume
+- estimated avoided tokens
+- total duration
+
+These metrics are stored in tool result details for benchmarking and debugging.
 
 ## Development
 
-### Building
-
 ```bash
-npm run build      # Compile TypeScript
-npm run watch      # Watch mode for development
-npm run clean      # Remove build artifacts
-```
-
-### Project Structure
-
-```
-pi_PTC/
-├── src/
-│   ├── index.ts              # Extension entry point
-│   ├── sandbox-manager.ts    # Container/subprocess management
-│   ├── code-executor.ts      # Execution orchestration
-│   ├── tool-wrapper.ts       # Python wrapper generation
-│   ├── tool-loader.ts        # Custom tool discovery
-│   ├── rpc-protocol.ts       # RPC (Node.js side)
-│   ├── utils.ts              # Utilities
-│   ├── types.ts              # TypeScript types
-│   └── python-runtime/
-│       ├── runtime.py        # Python execution entry
-│       └── rpc.py            # RPC (Python side)
-├── tools/                    # Custom tool definitions (.js files)
-├── dist/                     # Compiled output (git-ignored)
-├── package.json
-└── tsconfig.json
+npm run build
+npm test
 ```
 
 ## Troubleshooting
 
-### Extension not loading
+### `asyncio.run() cannot be called from a running event loop`
 
-1. Check pi-coding-agent recognizes the extension:
-   ```bash
-   pi --list-extensions
-   ```
+Remove `asyncio.run(...)` from model-generated Python. Top-level `await` is already available.
 
-2. Verify symlink is correct:
-   ```bash
-   ls -l ~/.pi/agent/extensions/ptc
-   ```
+### Tool not callable from Python
 
-3. Check build succeeded:
-   ```bash
-   ls dist/
-   ```
+Check one of these:
 
-### Python execution fails
+- the tool is blocked by policy
+- it is mutating and `PTC_ALLOW_MUTATIONS` is disabled
+- it is a custom/extension tool without `ptc.enabled: true`
 
-1. Verify Python 3.12+ is available:
-   ```bash
-   python3 --version
-   ```
+### Why did Python get a list instead of text?
 
-2. If using Docker, check Docker is running:
-   ```bash
-   docker --version
-   docker ps
-   ```
-
-3. Check logs for detailed error messages
-
-### Tool calls fail from Python
-
-1. Verify tool name matches exactly (check `pi.getAllTools()`)
-2. Check parameter types match schema
-3. Look for RPC protocol errors in output
-
-### Timeout issues
-
-For long-running operations:
-- Break into smaller chunks
-- Use progress updates: `print(f"Processed {i}/{total}")`
-- Consider if PTC is the right approach (very long operations might be better as separate tool calls)
-
-## FAQ
-
-**Q: Can I use external Python packages?**
-A: Not by default. The execution environment only includes Python standard library. Future versions may support pip install.
-
-**Q: Can I call pi-coding-agent tools from nested functions?**
-A: Yes! All tool wrapper functions are async and can be called from any async context in your code.
-
-**Q: What happens if my code has a syntax error?**
-A: Python will raise a SyntaxError which will be returned to Claude with the full traceback for debugging.
-
-**Q: Can I use threading or multiprocessing?**
-A: Yes, but keep in mind the 4.5 minute timeout applies to the entire execution.
-
-**Q: How do I debug my Python code?**
-A: Use `print()` statements — they'll be captured and included in the output.
-
-**Q: What's the overhead of PTC vs direct tool calls?**
-A: Slight overhead for a single tool call, but massive savings for 3+ sequential calls.
-
-**Q: Why can't I use tools from other pi extensions?**
-A: The pi extensions API does not currently support extensions exposing tools to each other. If you need a tool available in PTC, add it as a custom tool in the `tools/` directory.
+That is intentional for tools like `find`, `glob`, `ls`, and `grep`. The runtime normalizes those into structured values to improve cross-model reliability.
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue to discuss major changes before submitting a PR.

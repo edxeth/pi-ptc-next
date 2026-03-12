@@ -1,59 +1,71 @@
-import type { ToolDefinition, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { TSchema } from "@sinclair/typebox";
 import {
-  createReadTool,
   createBashTool,
   createEditTool,
-  createWriteTool,
-  createGrepTool,
   createFindTool,
+  createGrepTool,
   createLsTool,
+  createReadTool,
+  createWriteTool,
 } from "@mariozechner/pi-coding-agent";
-import type { ToolInfo } from "./types";
+import type { CallerMetadata, ExecuteToolContext, PtcSettings, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./types";
+
+function classifyTool(name: string, ptc?: PtcToolOptions): { isReadOnly: boolean } {
+  if (typeof ptc?.readOnly === "boolean") {
+    return { isReadOnly: ptc.readOnly };
+  }
+
+  switch (name) {
+    case "read":
+    case "find":
+    case "glob":
+    case "grep":
+    case "ls":
+      return { isReadOnly: true };
+    default:
+      return { isReadOnly: false };
+  }
+}
 
 /**
- * Registry for tracking registered tools and their execute functions
+ * Registry for tracking registered tools and their execute functions.
  */
 export class ToolRegistry {
   private tools = new Map<string, ToolInfo>();
   private originalRegisterTool: ExtensionAPI["registerTool"];
 
   constructor(private pi: ExtensionAPI) {
-    // Store the original registerTool method
     this.originalRegisterTool = pi.registerTool.bind(pi);
-
-    // Intercept tool registrations to build our registry
     pi.registerTool = this.interceptRegisterTool.bind(this);
   }
 
-  private interceptRegisterTool(tool: ToolDefinition<any, any>): void {
-    // Store the tool with its execute function
+  private interceptRegisterTool<TParams extends TSchema, TDetails>(
+    tool: ToolDefinition<TParams, TDetails>
+  ): void {
+    const ptc = (tool as PtcToolDefinition<TParams, TDetails>).ptc;
+    const classification = classifyTool(tool.name, ptc);
     this.tools.set(tool.name, {
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
       execute: tool.execute,
+      ptc,
+      source: "extension",
+      isReadOnly: classification.isReadOnly,
     });
 
-    // Call the original registerTool
     this.originalRegisterTool(tool);
   }
 
-  /**
-   * Remove a tool from the registry by name
-   */
   removeTool(name: string): boolean {
     return this.tools.delete(name);
   }
 
-  /**
-   * Create built-in tool instances using factory functions from pi-coding-agent.
-   * pi.getAllTools() only returns metadata (no execute), so we need these
-   * to get actual callable execute functions for built-in tools.
-   */
   private createBuiltinTools(cwd: string): Map<string, ToolInfo> {
     const builtins = new Map<string, ToolInfo>();
 
-    const factories: Array<{ name: string; create: (cwd: string) => any }> = [
+    const factories: Array<{ name: string; create: (cwd: string) => unknown }> = [
       { name: "read", create: createReadTool },
       { name: "bash", create: createBashTool },
       { name: "edit", create: createEditTool },
@@ -65,55 +77,81 @@ export class ToolRegistry {
 
     for (const { name, create } of factories) {
       try {
-        const tool = create(cwd);
+        const tool = create(cwd) as {
+          name: string;
+          description: string;
+          parameters: ToolInfo["parameters"];
+          execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<unknown>;
+        };
+        const classification = classifyTool(tool.name);
         builtins.set(name, {
           name: tool.name,
           description: tool.description,
           parameters: tool.parameters,
-          // AgentTool.execute has 4 args; ToolDefinition.execute has 5 (with ctx).
-          // Wrap to match the ToolDefinition signature.
-          execute: (toolCallId, params, signal, onUpdate, _ctx) =>
-            tool.execute(toolCallId, params, signal, onUpdate),
+          source: "builtin",
+          isReadOnly: classification.isReadOnly,
+          execute: async (toolCallId, params, signal, onUpdate, _ctx) =>
+            (await tool.execute(toolCallId, params, signal, onUpdate)) as never,
         });
       } catch {
-        // Skip tools that fail to create (e.g., missing dependencies)
+        // Skip tools that fail to create.
       }
+    }
+
+    const findTool = builtins.get("find");
+    if (findTool) {
+      builtins.set("glob", {
+        ...findTool,
+        name: "glob",
+        description: "Find files by glob pattern. Alias of find(). Returns a list of matching relative paths in code_execution.",
+        source: "alias",
+        isReadOnly: true,
+      });
     }
 
     return builtins;
   }
 
-  /**
-   * Get all registered tools
-   */
   getAllTools(cwd?: string): ToolInfo[] {
     const piTools = this.pi.getAllTools();
     const allTools = new Map<string, ToolInfo>();
-
-    // Create built-in tool instances with execute functions
     const builtinTools = this.createBuiltinTools(cwd || process.cwd());
 
-    // Add tools from pi.getAllTools() (metadata only)
-    for (const piTool of piTools) {
-      // Use factory-created builtin if available, otherwise mark as unavailable
-      const builtin = builtinTools.get(piTool.name);
-      const toolInfo: ToolInfo = {
-        name: piTool.name,
-        description: piTool.description,
-        parameters: piTool.parameters,
-        execute: builtin?.execute || (async () => {
-          throw new Error(`Tool ${piTool.name} execute function not available`);
-        }),
-      };
-      allTools.set(piTool.name, toolInfo);
-
-      // Store in our registry if not already intercepted
-      if (!this.tools.has(piTool.name) && builtin) {
-        this.tools.set(piTool.name, toolInfo);
+    for (const builtin of builtinTools.values()) {
+      allTools.set(builtin.name, builtin);
+      if (!this.tools.has(builtin.name)) {
+        this.tools.set(builtin.name, builtin);
       }
     }
 
-    // Override with intercepted tools (custom tools registered via pi.registerTool)
+    for (const piTool of piTools) {
+      const existing = allTools.get(piTool.name);
+      if (existing) {
+        allTools.set(piTool.name, {
+          ...existing,
+          description: piTool.description,
+          parameters: piTool.parameters,
+        });
+        continue;
+      }
+
+      const intercepted = this.tools.get(piTool.name);
+      const classification = classifyTool(piTool.name, intercepted?.ptc);
+      allTools.set(piTool.name, {
+        name: piTool.name,
+        description: piTool.description,
+        parameters: piTool.parameters,
+        execute:
+          intercepted?.execute ||
+          (async () => {
+            throw new Error(`Tool ${piTool.name} execute function not available`);
+          }),
+        ptc: intercepted?.ptc,
+        source: intercepted?.source || "extension",
+        isReadOnly: classification.isReadOnly,
+      });
+    }
+
     for (const [name, tool] of this.tools.entries()) {
       allTools.set(name, tool);
     }
@@ -121,24 +159,57 @@ export class ToolRegistry {
     return Array.from(allTools.values());
   }
 
-  /**
-   * Execute a tool by name
-   */
+  getCallableTools(cwd: string, settings: PtcSettings): ToolInfo[] {
+    const allTools = this.getAllTools(cwd);
+    const allowSet = settings.callableTools ? new Set(settings.callableTools) : null;
+    const blockedSet = new Set(settings.blockedTools || []);
+
+    return allTools.filter((tool) => {
+      if (tool.name === "code_execution") {
+        return false;
+      }
+
+      if (blockedSet.has(tool.name)) {
+        return false;
+      }
+
+      if (allowSet && !allowSet.has(tool.name)) {
+        return false;
+      }
+
+      if (!settings.allowMutations && !tool.isReadOnly) {
+        if (tool.name !== "bash" || !settings.allowBash) {
+          return false;
+        }
+      }
+
+      if (tool.name === "bash" && !settings.allowBash) {
+        return false;
+      }
+
+      if (tool.source === "builtin" || tool.source === "alias") {
+        return true;
+      }
+
+      return tool.ptc?.enabled === true;
+    });
+  }
+
   async executeTool(
     toolName: string,
-    params: any,
-    ctx: ExtensionContext,
-    signal?: AbortSignal
-  ): Promise<any> {
+    params: unknown,
+    execution: ExecuteToolContext
+  ): Promise<unknown> {
     const tool = this.tools.get(toolName);
     if (!tool) {
-      throw new Error(`Unknown tool: ${toolName}. Available: ${Array.from(this.tools.keys()).join(', ')}`);
+      throw new Error(`Unknown tool: ${toolName}. Available: ${Array.from(this.tools.keys()).join(", ")}`);
     }
 
-    // Generate a unique tool call ID
-    const toolCallId = `ptc_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const toolCallId = execution.caller?.nestedCallId || `ptc_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const ctxWithCaller = Object.assign({}, execution.ctx, {
+      caller: execution.caller,
+    }) as ExtensionContext & { caller?: CallerMetadata };
 
-    // Execute the tool
-    return await tool.execute(toolCallId, params, signal, undefined, ctx);
+    return await tool.execute(toolCallId, params, execution.signal, undefined, ctxWithCaller);
   }
 }

@@ -1,23 +1,20 @@
-import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
-import type { Component } from "@mariozechner/pi-tui";
-import type { Theme } from "@mariozechner/pi-coding-agent";
+import { Type, type TSchema } from "@sinclair/typebox";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
+import { Text, type Component } from "@mariozechner/pi-tui";
 import { CodeExecutor } from "./code-executor";
 import { createSandbox } from "./sandbox-manager";
-import { ToolRegistry } from "./tool-registry";
 import { loadTools } from "./tool-loader";
+import { ToolRegistry } from "./tool-registry";
+import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager } from "./types";
 import { watchTools } from "./tool-watcher";
-import type { SandboxManager, ExecutionDetails } from "./types";
+import { loadSettingsFromEnv } from "./utils";
 
 let sandboxManager: SandboxManager | null = null;
 let codeExecutor: CodeExecutor | null = null;
 let toolRegistry: ToolRegistry | null = null;
 let toolWatcher: { close(): void } | null = null;
+let settings: PtcSettings | null = null;
 
-/**
- * Render Python code with current line highlighting during execution
- */
 function renderExecutingCode(
   codeLines: string[],
   currentLine: number,
@@ -25,29 +22,22 @@ function renderExecutingCode(
   theme: Theme
 ): Component {
   const lines: string[] = [];
-
-  // Header
   lines.push(theme.fg("muted", `Executing Python code (line ${currentLine}/${totalLines}):`));
   lines.push("");
 
-  // Show code with line numbers and highlight
-  codeLines.forEach((line, idx) => {
-    const lineNum = idx + 1;
-    const isCurrentLine = lineNum === currentLine;
-
-    let prefix = `${String(lineNum).padStart(3, " ")} │ `;
+  codeLines.forEach((line, index) => {
+    const lineNumber = index + 1;
+    const isCurrentLine = lineNumber === currentLine;
+    let prefix = `${String(lineNumber).padStart(3, " ")} │ `;
     let content = line;
 
     if (isCurrentLine) {
-      // Highlight current line with arrow
-      prefix = theme.fg("success", `→ ${String(lineNum).padStart(2, " ")} │ `);
+      prefix = theme.fg("success", `→ ${String(lineNumber).padStart(2, " ")} │ `);
       content = theme.fg("text", line);
-    } else if (lineNum < currentLine) {
-      // Already executed - muted
+    } else if (lineNumber < currentLine) {
       prefix = theme.fg("muted", prefix);
       content = theme.fg("muted", line);
     } else {
-      // Not yet executed - normal
       prefix = theme.fg("muted", prefix);
     }
 
@@ -57,24 +47,79 @@ function renderExecutingCode(
   return new Text(lines.join("\n"), 0, 0);
 }
 
-/**
- * PTC (Programmatic Tool Calling) Extension
- * Enables Claude to write Python code that calls tools as async functions
- */
-export default async function ptcExtension(pi: ExtensionAPI, context: ExtensionContext) {
-  // Initialize tool registry (intercepts tool registrations)
-  toolRegistry = new ToolRegistry(pi);
+function renderCompletedOutput(resultText: string, details: ExecutionDetails | undefined, theme: Theme): Component {
+  if (!details) {
+    return new Text(resultText || "(No output)", 0, 0);
+  }
 
-  // Initialize sandbox manager (will try Docker first, fallback to subprocess)
-  sandboxManager = await createSandbox();
-  codeExecutor = new CodeExecutor(sandboxManager, toolRegistry, context);
+  const summary = theme.fg(
+    "muted",
+    `[PTC] nested calls=${details.nestedToolCalls}, nested results=${details.nestedResultCount}, ` +
+      `estimated avoided tokens≈${details.estimatedAvoidedTokens}, duration=${Math.round(details.durationMs / 1000)}s`
+  );
 
-  // Load and register custom tools from tools/ directory
-  const extensionRoot = __dirname.endsWith("/dist") || __dirname.endsWith("\\dist")
+  const body = resultText || "(No output)";
+  return new Text(`${summary}\n\n${body}`, 0, 0);
+}
+
+function buildToolDescription(currentSettings: PtcSettings): string {
+  const callable = currentSettings.callableTools?.length
+    ? currentSettings.callableTools.join(", ")
+    : currentSettings.allowMutations
+      ? "read, glob, find, grep, ls, edit, write" + (currentSettings.allowBash ? ", bash" : "")
+      : "read, glob, find, grep, ls" + (currentSettings.allowBash ? ", bash" : "");
+
+  return `Execute Python code with local programmatic tool calling.
+
+Use this tool when you need 3+ dependent tool calls, loops, filtering, aggregation, or large intermediate results that should stay out of the chat context. Avoid it for a single simple tool call.
+
+Important rules:
+- Top-level await is already available. Do not call asyncio.run(...).
+- Use generated helpers such as read(), glob(), find(), grep(), ls(), and ptc.* helpers. Do not call _rpc_call(...) directly.
+- Return a compact final answer only. If you return a dict/list, it will be JSON-serialized automatically.
+- Intermediate tool results stay local to this tool run and are not sent back to the model unless you include them in the final output.
+- Prefer compact JSON summaries over raw dumps.
+
+Prefer these patterns:
+- Many file reads from explicit paths: ptc.read_many(paths, limit=...)
+- Find and read an entire tree: ptc.read_tree(pattern=..., path=..., concurrency=...)
+- Bounded concurrency for arbitrary coroutines: ptc.gather_limit(coros, limit=...)
+- Relative file discovery: glob(...) or ptc.find_files(...)
+- Absolute file discovery for later read()/write(): ptc.find_files_abs(...)
+
+Python helpers currently available in this session:
+- read(path, file_path=None, offset=None, limit=None) -> str
+- glob(pattern, path='.', limit=1000) -> list[str]
+- find(pattern, path='.', limit=1000) -> list[str]
+- grep(...) -> list[dict]
+- ls(path='.', limit=500) -> list[str]
+- ptc.gather_limit(coros, limit=...) -> list
+- ptc.read_many(paths, limit=..., offset=None, line_limit=None) -> list[str]
+- ptc.read_tree(pattern=..., path='.', limit=1000, concurrency=..., offset=None, line_limit=None) -> list[dict]
+- ptc.find_files(...), ptc.find_files_abs(...), ptc.read_text(...), ptc.json_dump(...)
+
+Callable tool set for this session: ${callable}
+
+Example:
+
+entries = await ptc.read_tree(pattern="**/*.ts", path="src", concurrency=6)
+return {
+  "files": len(entries),
+  "sample_lengths": [len(entry["content"]) for entry in entries[:3]],
+}`;
+}
+
+
+function getExtensionRoot(): string {
+  return __dirname.endsWith("/dist") || __dirname.endsWith("\\dist")
     ? __dirname.replace(/[/\\]dist$/, "")
     : __dirname;
+}
+
+async function registerLoadedTools(pi: ExtensionAPI, extensionRoot: string): Promise<Map<string, string>> {
   const loadedTools = await loadTools(extensionRoot);
   const initialFileMap = new Map<string, string>();
+
   for (const { tool, filename } of loadedTools) {
     pi.registerTool({
       name: tool.name,
@@ -82,42 +127,23 @@ export default async function ptcExtension(pi: ExtensionAPI, context: ExtensionC
       description: tool.description,
       parameters: tool.parameters,
       execute: tool.execute,
-    });
+      ptc: tool.ptc,
+    } as PtcToolDefinition);
     initialFileMap.set(filename, tool.name);
   }
 
-  // Start watching tools/ for hot-reload
-  toolWatcher = watchTools(extensionRoot, pi, toolRegistry, initialFileMap);
+  return initialFileMap;
+}
 
-  // Register the code_execution tool
-  pi.registerTool({
+function buildCodeExecutionTool(): PtcToolDefinition {
+  return {
     name: "code_execution",
     label: "Code Execution",
-    description: `Execute Python code with async tool calling support.
-
-This tool allows you to write Python code that calls other tools as async functions. All available tools are exposed as Python async functions that you can await.
-
-Example:
-\`\`\`python
-# Read and analyze files
-files = await glob(pattern="**/*.ts")
-for file_path in files[:5]:
-    content = await read(file_path=file_path)
-    if "TODO" in content:
-        print(f"Found TODO in {file_path}")
-\`\`\`
-
-Key features:
-- All tools available as async Python functions
-- Multi-tool workflows execute in a single round-trip
-- Reduced token usage and latency
-- Subprocess execution (Docker isolation available via PTC_USE_DOCKER=true)
-- 4.5 minute timeout
-
-The code runs in a Python 3.12 subprocess. Use standard Python libraries and async/await syntax.`,
+    description: buildToolDescription(settings as PtcSettings),
     parameters: Type.Object({
       code: Type.String({
-        description: "Python code to execute. Can use await to call any available tool.",
+        description:
+          "Python code to execute. Top-level await is supported; do not call asyncio.run(...). Prefer returning a compact final result.",
       }),
     }),
     execute: async (toolCallId, { code }, signal, onUpdate, ctx) => {
@@ -126,31 +152,24 @@ The code runs in a Python 3.12 subprocess. Use standard Python libraries and asy
       }
 
       try {
-        const output = await codeExecutor.execute(code, {
+        const result = await codeExecutor.execute(code, {
           cwd: ctx.cwd,
           signal,
           onUpdate,
+          parentToolCallId: toolCallId,
         });
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: output || "(No output)",
-            },
-          ],
-          details: undefined,
+          content: [{ type: "text" as const, text: result.output || "(No output)" }],
+          details: result.details,
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`Python execution failed: ${message}`);
       }
     },
-
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, { isPartial }, theme) {
       const details = result.details as ExecutionDetails | undefined;
-
-      // During execution, show code with current line highlighted
       if (isPartial && details?.userCode && details.currentLine) {
         return renderExecutingCode(
           details.userCode,
@@ -160,27 +179,44 @@ The code runs in a Python 3.12 subprocess. Use standard Python libraries and asy
         );
       }
 
-      // After execution completes, show final output
       const text = result.content
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text)
+        .filter((content): content is { type: "text"; text: string } => content.type === "text")
+        .map((content) => content.text)
         .join("");
 
-      return new Text(text || "(No output)", 0, 0);
+      return renderCompletedOutput(text, details, theme);
     },
-  });
+  };
+}
 
-  // Register cleanup on session shutdown
-  pi.on("session_shutdown", async () => {
-    if (toolWatcher) {
-      toolWatcher.close();
-      toolWatcher = null;
-    }
-    if (sandboxManager) {
-      await sandboxManager.cleanup();
-      sandboxManager = null;
-    }
-    codeExecutor = null;
-    toolRegistry = null;
-  });
+async function cleanupSessionResources(): Promise<void> {
+  if (toolWatcher) {
+    toolWatcher.close();
+    toolWatcher = null;
+  }
+  if (sandboxManager) {
+    await sandboxManager.cleanup();
+    sandboxManager = null;
+  }
+  codeExecutor = null;
+  toolRegistry = null;
+  settings = null;
+}
+
+/**
+ * PTC (Programmatic Tool Calling) extension.
+ */
+export default async function ptcExtension(pi: ExtensionAPI, context: ExtensionContext) {
+  settings = loadSettingsFromEnv();
+  const extensionRoot = getExtensionRoot();
+
+  toolRegistry = new ToolRegistry(pi);
+  sandboxManager = await createSandbox();
+  codeExecutor = new CodeExecutor(sandboxManager, toolRegistry, context, settings, extensionRoot);
+
+  const initialFileMap = await registerLoadedTools(pi, extensionRoot);
+  toolWatcher = watchTools(extensionRoot, pi, toolRegistry, initialFileMap);
+  pi.registerTool(buildCodeExecutionTool());
+
+  pi.on("session_shutdown", cleanupSessionResources);
 }

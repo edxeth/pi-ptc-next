@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test test/*.test.ts"
   },
   "keywords": [
     "pi-coding-agent",

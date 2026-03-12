@@ -1,6 +1,8 @@
+import { randomUUID } from "crypto";
 import { spawn, exec, execSync } from "child_process";
 import { promisify } from "util";
 import type { SandboxManager } from "./types";
+import { debugLog, debugWarn } from "./utils";
 
 const execAsync = promisify(exec);
 
@@ -56,14 +58,18 @@ class DockerSandbox implements SandboxManager {
   private async stopContainer() {
     if (!this.containerId) return;
 
-    try {
-      await execAsync(`docker stop ${this.containerId}`);
-    } catch (error) {
-      // Container might already be stopped
-      console.error(`Failed to stop container ${this.containerId}:`, error);
-    }
-
+    const containerId = this.containerId;
     this.containerId = null;
+
+    try {
+      await execAsync(`docker stop ${containerId}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("No such container") || message.includes("is not running")) {
+        return;
+      }
+      throw new Error(`Failed to stop container ${containerId}: ${message}`);
+    }
   }
 
   spawn(code: string, cwd: string): import("child_process").ChildProcess {
@@ -130,20 +136,20 @@ async function isDockerAvailable(): Promise<boolean> {
  * Create a sandbox manager (uses subprocess by default, Docker opt-in via PTC_USE_DOCKER=true)
  */
 export async function createSandbox(): Promise<SandboxManager> {
-  const sessionId = Math.random().toString(36).substring(7);
+  const sessionId = randomUUID();
   const useDocker = process.env.PTC_USE_DOCKER === "true";
 
   if (useDocker) {
     const dockerAvailable = await isDockerAvailable();
     if (dockerAvailable) {
-      console.log("[PTC] Using Docker sandbox (PTC_USE_DOCKER=true)");
+      debugLog("Using Docker sandbox (PTC_USE_DOCKER=true)");
       return new DockerSandbox(sessionId);
     } else {
-      console.log("[PTC] Docker requested but not available, falling back to subprocess sandbox");
+      debugWarn("Docker requested but not available, falling back to subprocess sandbox");
       return new SubprocessSandbox();
     }
   } else {
-    console.log("[PTC] Using subprocess sandbox (default)");
+    debugLog("Using subprocess sandbox (default)");
     return new SubprocessSandbox();
   }
 }
