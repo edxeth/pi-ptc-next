@@ -36,3 +36,12 @@ test("normalizeToolResult returns details.ptcValue when present", () => {
 
   assert.deepEqual(result.value, value);
 });
+
+test("normalizeToolResult keeps custom tool fallback on text only", () => {
+  const result = normalizeToolResult("query_db", {
+    content: [{ type: "text", text: "Returned 1 rows" }],
+    details: { internal: true },
+  });
+
+  assert.equal(result.value, "Returned 1 rows");
+});

@@ -77,6 +77,7 @@ If `details.ptcValue` is omitted, pi-ptc falls back to normalizing the tool's te
 ## Notes
 
 - Only `.js` files are loaded
-- Tools are loaded at startup and hot-reloaded when files change
+- Invalid tools fail startup loading instead of being silently ignored
+- Hot reload removes the previous tool if a changed file becomes invalid, so stale behavior does not stay active
 - `ctx.caller` may contain local caller metadata when invoked from `code_execution`
 - Keep Python-facing return values compact and JSON-compatible when possible

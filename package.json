@@ -4,11 +4,34 @@
   "description": "Programmatic Tool Calling (PTC) extension for pi-coding-agent - enables Python code execution with async tool calls",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./execution/*": {
+      "types": "./dist/execution/*.d.ts",
+      "default": "./dist/execution/*.js"
+    },
+    "./tools/*": {
+      "types": "./dist/tools/*.d.ts",
+      "default": "./dist/tools/*.js"
+    }
+  },
   "files": [
     "dist",
     "src/python-runtime",
     "tools"
   ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
@@ -28,7 +51,8 @@
     "@mariozechner/pi-coding-agent": "*"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.32.0"
+    "@mariozechner/pi-tui": "^0.55.1",
+    "@sinclair/typebox": "^0.34.41"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

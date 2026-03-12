@@ -1,8 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { generateToolWrappers } = require("../dist/tool-wrapper.js");
+const { generateToolWrappers } = require("../dist/tools/tool-wrapper.js");
 
-test("generateToolWrappers emits read compatibility and typed helpers", () => {
+test("generateToolWrappers emits concise wrappers with typed result models", () => {
   const code = generateToolWrappers([
     {
       name: "read",
@@ -26,7 +26,10 @@ test("generateToolWrappers emits read compatibility and typed helpers", () => {
         type: "object",
         properties: {
           pattern: { type: "string", description: "Glob" },
-          path: { type: "string", description: "Base path" },
+          path: {
+            anyOf: [{ type: "string" }, { type: "integer" }],
+            description: "Base path or numeric selector",
+          },
         },
         required: ["pattern"],
       },
@@ -34,11 +37,32 @@ test("generateToolWrappers emits read compatibility and typed helpers", () => {
       isReadOnly: true,
       execute: async () => ({ content: [{ type: "text", text: "ok" }], details: undefined }),
     },
+    {
+      name: "bash",
+      description: "Run shell command",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Command" },
+        },
+        required: ["command"],
+      },
+      source: "builtin",
+      isReadOnly: false,
+      execute: async () => ({ content: [{ type: "text", text: "ok" }], details: undefined }),
+    },
   ]);
 
+  assert.match(code, /from typing import Optional, List, Dict, Any, TypedDict, Union/);
+  assert.match(code, /class BashResult\(TypedDict\):/);
+  assert.match(code, /class GrepMatch\(TypedDict\):/);
   assert.match(code, /async def read\(/);
-  assert.match(code, /file_path: Optional\[str\] = None/);
+  assert.match(code, /path: str/);
+  assert.doesNotMatch(code, /file_path/);
   assert.match(code, /async def glob\(/);
-  assert.match(code, /-> List\[str\]/);
+  assert.match(code, /path: Optional\[Union\[str, int\]\] = None/);
+  assert.match(code, /async def bash\(/);
+  assert.match(code, /\) -> BashResult:/);
+  assert.doesNotMatch(code, /Args:/);
   assert.match(code, /return await _rpc_call\("glob", params\)/);
 });

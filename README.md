@@ -39,7 +39,7 @@ This implementation now focuses on provider-agnostic reliability:
 
 By default, Python code inside `code_execution` can call a safe built-in subset:
 
-- `read(path, file_path=None, offset=None, limit=None) -> str`
+- `read(path, offset=None, limit=None) -> str`
 - `glob(pattern, path='.', limit=1000) -> list[str]`
 - `find(pattern, path='.', limit=1000) -> list[str]`
 - `grep(...) -> list[dict]`
@@ -80,10 +80,10 @@ Important runtime rules:
 The runtime also exposes a `ptc` helper object:
 
 - `await ptc.gather_limit(coros, limit=8)`
-- `await ptc.read_many(paths, limit=8, offset=None, line_limit=None)`
-- `await ptc.read_tree(pattern, path='.', limit=1000, concurrency=None, offset=None, line_limit=None)`
-- `await ptc.find_files(pattern, path='.', limit=1000)`
-- `await ptc.find_files_abs(pattern, path='.', limit=1000)`
+- `await ptc.read_many(paths, max_concurrency=None, offset=None, line_limit=None)`
+- `await ptc.read_tree(pattern, path='.', max_files=1000, concurrency=None, offset=None, line_limit=None)`
+- `await ptc.find_files(pattern, path='.', max_files=1000)`
+- `await ptc.find_files_abs(pattern, path='.', max_files=1000)`
 - `await ptc.read_text(path, offset=None, limit=None)`
 - `ptc.json_dump(value)`
 
@@ -137,6 +137,7 @@ ptc: {
 ### Execution
 
 - `PTC_USE_DOCKER=true` — run Python inside Docker instead of a local subprocess
+- `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` — explicitly opt into local subprocess mode when Docker is not used
 - `PTC_EXECUTION_TIMEOUT_MS=270000` — hard timeout for the full Python execution
 - `PTC_MAX_OUTPUT_CHARS=100000` — truncate final output after this many characters
 - `PTC_MAX_PARALLEL_TOOL_CALLS=8` — default concurrency for `ptc.gather_limit()`
@@ -145,6 +146,7 @@ ptc: {
 
 - `PTC_ALLOW_MUTATIONS=true` — allow mutating tools from Python
 - `PTC_ALLOW_BASH=true` — allow `bash` from Python
+- `PTC_TRUSTED_READ_ONLY_TOOLS=query_db,fetch_metadata` — allowlisted custom tools treated as read-only when mutations are disabled
 - `PTC_CALLABLE_TOOLS=read,glob,find,grep,ls` — explicit allowlist override
 - `PTC_BLOCKED_TOOLS=bash,write` — explicit denylist override
 
@@ -174,21 +176,32 @@ Python returns one compact final output
 - `src/code-executor.ts` — execution orchestration and global timeout
 - `src/tool-registry.ts` — tool discovery, policy, and caller metadata
 - `src/tool-adapters.ts` — normalization of pi tool results
-- `src/tool-wrapper.ts` — Python wrapper generation
 - `src/rpc-protocol.ts` — Node-side RPC bridge and nested metrics
 - `src/python-runtime/runtime.py` — Python runtime and helpers
 - `src/python-runtime/rpc.py` — Python-side RPC client
-- `src/tool-loader.ts` / `src/tool-watcher.ts` — custom tool loading and hot reload
+- `src/custom-tool-manager.ts` — authoritative custom tool loading, registration, and hot reload
+- `src/execution/` — execution session, sandbox, runtime assets, and error boundaries
+- `src/tools/` — Python helper contracts, wrapper generation, and tool policy integration
 
 ## Execution modes
 
 ### Subprocess mode
 
-Default mode.
+Explicit opt-in mode.
+
+Enable with:
+
+```bash
+export PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true
+```
+
+Behavior:
 
 - runs `python3 -u -c ...` in the current working directory
 - simplest setup
 - suitable for trusted local use
+- only enabled when Docker mode is disabled
+- if neither `PTC_USE_DOCKER=true` nor `PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true` is set, PTC refuses to execute Python
 
 ### Docker mode
 
@@ -266,6 +279,17 @@ Completed `code_execution` runs now record local nested execution stats, includi
 - total duration
 
 These metrics are stored in tool result details for benchmarking and debugging.
+
+### Measured token savings
+
+On the benchmark task of analyzing the first 8 `test/**/*.test.ts` files and returning compact JSON only, `pi-ptc` materially reduced token consumption by keeping intermediate file contents inside Python instead of sending them back through ordinary tool results.
+
+Observed averages in this environment:
+
+- GPT-5.4: `20,294.5` tokens with `pi-ptc` vs `88,158` without it (`76.98%` reduction)
+- GLM-5: `16,973` tokens with `pi-ptc` vs `33,100` without it (`48.72%` reduction)
+
+The exact totals vary by model behavior and tool strategy, but both model families successfully used `code_execution`, which demonstrates the provider-agnostic design in practice.
 
 ## Development
 

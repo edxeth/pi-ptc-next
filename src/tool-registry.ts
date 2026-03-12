@@ -1,5 +1,4 @@
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
-import type { TSchema } from "@sinclair/typebox";
 import {
   createBashTool,
   createEditTool,
@@ -9,43 +8,57 @@ import {
   createReadTool,
   createWriteTool,
 } from "@mariozechner/pi-coding-agent";
-import type { CallerMetadata, ExecuteToolContext, PtcSettings, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./types";
+import type { TSchema } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
+import { classifyBuiltinTool, validatePythonHelperNames } from "./tools/python-tool-contract";
+import type { PtcSettings } from "./contracts/settings";
+import type { CallerMetadata, ExecuteToolContext, PtcToolDefinition, PtcToolOptions, ToolInfo } from "./contracts/tool-types";
+import { logWarning } from "./utils";
 
 function classifyTool(name: string, ptc?: PtcToolOptions): { isReadOnly: boolean } {
-  if (typeof ptc?.readOnly === "boolean") {
-    return { isReadOnly: ptc.readOnly };
-  }
-
-  switch (name) {
-    case "read":
-    case "find":
-    case "glob":
-    case "grep":
-    case "ls":
-      return { isReadOnly: true };
-    default:
-      return { isReadOnly: false };
-  }
+  return classifyBuiltinTool(name, ptc);
 }
 
-/**
- * Registry for tracking registered tools and their execute functions.
- */
-export class ToolRegistry {
-  private tools = new Map<string, ToolInfo>();
-  private originalRegisterTool: ExtensionAPI["registerTool"];
+export interface CallableToolRuntime {
+  tools: ToolInfo[];
+  runTool(toolName: string, params: unknown, nestedCallId: string): Promise<unknown>;
+}
 
-  constructor(private pi: ExtensionAPI) {
-    this.originalRegisterTool = pi.registerTool.bind(pi);
-    pi.registerTool = this.interceptRegisterTool.bind(this);
+type BuiltinTool =
+  | ReturnType<typeof createReadTool>
+  | ReturnType<typeof createBashTool>
+  | ReturnType<typeof createEditTool>
+  | ReturnType<typeof createWriteTool>
+  | ReturnType<typeof createGrepTool>
+  | ReturnType<typeof createFindTool>
+  | ReturnType<typeof createLsTool>;
+
+type BuiltinToolFactory = (cwd: string) => BuiltinTool;
+
+function validateToolParams(tool: ToolInfo, params: unknown): void {
+  if (Value.Check(tool.parameters as TSchema, params)) {
+    return;
   }
 
-  private interceptRegisterTool<TParams extends TSchema, TDetails>(
-    tool: ToolDefinition<TParams, TDetails>
-  ): void {
+  const details = [...Value.Errors(tool.parameters as TSchema, params)]
+    .slice(0, 3)
+    .map((error) => `${error.path || "/"}: ${error.message}`)
+    .join("; ");
+  const suffix = details ? ` ${details}` : "";
+  throw new Error(`Invalid parameters for ${tool.name}.${suffix}`.trim());
+}
+
+export class ToolRegistry {
+  private customTools = new Map<string, ToolInfo>();
+  private extensionOwnedToolNames = new Set<string>();
+
+  constructor(private pi: ExtensionAPI) {}
+
+  upsertTool<TParams extends TSchema, TDetails>(tool: ToolDefinition<TParams, TDetails>): void {
     const ptc = (tool as PtcToolDefinition<TParams, TDetails>).ptc;
     const classification = classifyTool(tool.name, ptc);
-    this.tools.set(tool.name, {
+    this.extensionOwnedToolNames.add(tool.name);
+    this.customTools.set(tool.name, {
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
@@ -54,18 +67,16 @@ export class ToolRegistry {
       source: "extension",
       isReadOnly: classification.isReadOnly,
     });
-
-    this.originalRegisterTool(tool);
   }
 
   removeTool(name: string): boolean {
-    return this.tools.delete(name);
+    this.extensionOwnedToolNames.add(name);
+    return this.customTools.delete(name);
   }
 
   private createBuiltinTools(cwd: string): Map<string, ToolInfo> {
     const builtins = new Map<string, ToolInfo>();
-
-    const factories: Array<{ name: string; create: (cwd: string) => unknown }> = [
+    const factories: Array<{ name: string; create: BuiltinToolFactory }> = [
       { name: "read", create: createReadTool },
       { name: "bash", create: createBashTool },
       { name: "edit", create: createEditTool },
@@ -77,12 +88,8 @@ export class ToolRegistry {
 
     for (const { name, create } of factories) {
       try {
-        const tool = create(cwd) as {
-          name: string;
-          description: string;
-          parameters: ToolInfo["parameters"];
-          execute: (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: unknown) => Promise<unknown>;
-        };
+        const tool = create(cwd);
+        const executeBuiltin = tool.execute as ToolInfo["execute"];
         const classification = classifyTool(tool.name);
         builtins.set(name, {
           name: tool.name,
@@ -90,11 +97,12 @@ export class ToolRegistry {
           parameters: tool.parameters,
           source: "builtin",
           isReadOnly: classification.isReadOnly,
-          execute: async (toolCallId, params, signal, onUpdate, _ctx) =>
-            (await tool.execute(toolCallId, params, signal, onUpdate)) as never,
+          execute: async (toolCallId, params, signal, onUpdate, ctx) =>
+            await executeBuiltin(toolCallId, params, signal, onUpdate, ctx),
         });
-      } catch {
-        // Skip tools that fail to create.
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logWarning(`Builtin tool '${name}' failed to initialize: ${message}`);
       }
     }
 
@@ -112,19 +120,23 @@ export class ToolRegistry {
     return builtins;
   }
 
-  getAllTools(cwd?: string): ToolInfo[] {
-    const piTools = this.pi.getAllTools();
+  private buildToolMap(cwd?: string): Map<string, ToolInfo> {
     const allTools = new Map<string, ToolInfo>();
     const builtinTools = this.createBuiltinTools(cwd || process.cwd());
 
     for (const builtin of builtinTools.values()) {
       allTools.set(builtin.name, builtin);
-      if (!this.tools.has(builtin.name)) {
-        this.tools.set(builtin.name, builtin);
-      }
     }
 
-    for (const piTool of piTools) {
+    for (const customTool of this.customTools.values()) {
+      allTools.set(customTool.name, customTool);
+    }
+
+    for (const piTool of this.pi.getAllTools()) {
+      if (this.extensionOwnedToolNames.has(piTool.name) && !this.customTools.has(piTool.name)) {
+        continue;
+      }
+
       const existing = allTools.get(piTool.name);
       if (existing) {
         allTools.set(piTool.name, {
@@ -135,81 +147,100 @@ export class ToolRegistry {
         continue;
       }
 
-      const intercepted = this.tools.get(piTool.name);
-      const classification = classifyTool(piTool.name, intercepted?.ptc);
+      const classification = classifyTool(piTool.name);
       allTools.set(piTool.name, {
         name: piTool.name,
         description: piTool.description,
         parameters: piTool.parameters,
-        execute:
-          intercepted?.execute ||
-          (async () => {
-            throw new Error(`Tool ${piTool.name} execute function not available`);
-          }),
-        ptc: intercepted?.ptc,
-        source: intercepted?.source || "extension",
+        execute: async () => {
+          throw new Error(`Tool ${piTool.name} execute function not available`);
+        },
+        source: "extension",
         isReadOnly: classification.isReadOnly,
       });
     }
 
-    for (const [name, tool] of this.tools.entries()) {
-      allTools.set(name, tool);
-    }
+    return allTools;
+  }
 
-    return Array.from(allTools.values());
+  getAllTools(cwd?: string): ToolInfo[] {
+    return Array.from(this.buildToolMap(cwd).values());
   }
 
   getCallableTools(cwd: string, settings: PtcSettings): ToolInfo[] {
     const allTools = this.getAllTools(cwd);
     const allowSet = settings.callableTools ? new Set(settings.callableTools) : null;
     const blockedSet = new Set(settings.blockedTools || []);
+    const trustedReadOnlyTools = new Set(settings.trustedReadOnlyTools || []);
 
-    return allTools.filter((tool) => {
+    const callableTools = allTools.filter((tool) => {
       if (tool.name === "code_execution") {
         return false;
       }
-
       if (blockedSet.has(tool.name)) {
         return false;
       }
-
       if (allowSet && !allowSet.has(tool.name)) {
         return false;
       }
-
-      if (!settings.allowMutations && !tool.isReadOnly) {
-        if (tool.name !== "bash" || !settings.allowBash) {
-          return false;
-        }
-      }
-
       if (tool.name === "bash" && !settings.allowBash) {
         return false;
       }
 
-      if (tool.source === "builtin" || tool.source === "alias") {
-        return true;
+      const isBuiltin = tool.source === "builtin" || tool.source === "alias";
+      const isTrustedReadOnlyCustom =
+        !isBuiltin &&
+        tool.ptc?.enabled === true &&
+        tool.ptc?.readOnly === true &&
+        trustedReadOnlyTools.has(tool.name);
+
+      if (!settings.allowMutations) {
+        if (!isBuiltin && !isTrustedReadOnlyCustom) {
+          return false;
+        }
+        if (!tool.isReadOnly && !isTrustedReadOnlyCustom) {
+          return false;
+        }
       }
 
-      return tool.ptc?.enabled === true;
+      return isBuiltin || tool.ptc?.enabled === true;
     });
+
+    validatePythonHelperNames(callableTools);
+    return callableTools;
   }
 
-  async executeTool(
-    toolName: string,
-    params: unknown,
-    execution: ExecuteToolContext
-  ): Promise<unknown> {
-    const tool = this.tools.get(toolName);
-    if (!tool) {
-      throw new Error(`Unknown tool: ${toolName}. Available: ${Array.from(this.tools.keys()).join(", ")}`);
-    }
+  createCallableToolRuntime(
+    cwd: string,
+    settings: PtcSettings,
+    execution: ExecuteToolContext & { parentToolCallId?: string }
+  ): CallableToolRuntime {
+    const callableTools = this.getCallableTools(cwd, settings);
+    const callableToolMap = new Map(callableTools.map((tool) => [tool.name, tool]));
 
-    const toolCallId = execution.caller?.nestedCallId || `ptc_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    const ctxWithCaller = Object.assign({}, execution.ctx, {
-      caller: execution.caller,
-    }) as ExtensionContext & { caller?: CallerMetadata };
+    return {
+      tools: callableTools,
+      runTool: async (toolName, params, nestedCallId) => {
+        const tool = callableToolMap.get(toolName);
+        if (!tool) {
+          throw new Error(
+            `Unknown callable tool: ${toolName}. Available: ${Array.from(callableToolMap.keys()).join(", ")}`
+          );
+        }
 
-    return await tool.execute(toolCallId, params, execution.signal, undefined, ctxWithCaller);
+        validateToolParams(tool, params);
+
+        const toolCallId = nestedCallId || `ptc_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        const ctxWithCaller = Object.assign({}, execution.ctx, {
+          caller: {
+            type: "code_execution",
+            parentToolCallId: execution.parentToolCallId,
+            nestedCallId: toolCallId,
+          } satisfies CallerMetadata,
+        }) as ExtensionContext & { caller?: CallerMetadata };
+
+        return await tool.execute(toolCallId, params, execution.signal, undefined, ctxWithCaller);
+      },
+    };
   }
 }

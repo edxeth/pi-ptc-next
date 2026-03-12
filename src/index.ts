@@ -1,19 +1,13 @@
-import { Type, type TSchema } from "@sinclair/typebox";
+import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
 import { Text, type Component } from "@mariozechner/pi-tui";
 import { CodeExecutor } from "./code-executor";
+import { CustomToolManager } from "./custom-tool-manager";
 import { createSandbox } from "./sandbox-manager";
-import { loadTools } from "./tool-loader";
+import { describePythonHelpers } from "./tools/python-tool-contract";
 import { ToolRegistry } from "./tool-registry";
-import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager } from "./types";
-import { watchTools } from "./tool-watcher";
+import type { ExecutionDetails, PtcSettings, PtcToolDefinition, SandboxManager, ToolInfo } from "./types";
 import { loadSettingsFromEnv } from "./utils";
-
-let sandboxManager: SandboxManager | null = null;
-let codeExecutor: CodeExecutor | null = null;
-let toolRegistry: ToolRegistry | null = null;
-let toolWatcher: { close(): void } | null = null;
-let settings: PtcSettings | null = null;
 
 function renderExecutingCode(
   codeLines: string[],
@@ -62,12 +56,12 @@ function renderCompletedOutput(resultText: string, details: ExecutionDetails | u
   return new Text(`${summary}\n\n${body}`, 0, 0);
 }
 
-function buildToolDescription(currentSettings: PtcSettings): string {
-  const callable = currentSettings.callableTools?.length
-    ? currentSettings.callableTools.join(", ")
-    : currentSettings.allowMutations
-      ? "read, glob, find, grep, ls, edit, write" + (currentSettings.allowBash ? ", bash" : "")
-      : "read, glob, find, grep, ls" + (currentSettings.allowBash ? ", bash" : "");
+function buildToolDescription(currentSettings: PtcSettings, callableTools: ToolInfo[]): string {
+  const callableHelperLines = describePythonHelpers(callableTools);
+  const callable = callableTools.map((tool) => tool.ptc?.pythonName || tool.name).join(", ");
+  const dockerBehavior = currentSettings.useDocker
+    ? "- Docker isolation is required for this session; if Docker is unavailable, execution fails instead of falling back to subprocess."
+    : "- Local subprocess mode is active because PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true. Nested tool policy still applies, but Python itself is not isolated by Docker in this mode.";
 
   return `Execute Python code with local programmatic tool calling.
 
@@ -79,36 +73,35 @@ Important rules:
 - Return a compact final answer only. If you return a dict/list, it will be JSON-serialized automatically.
 - Intermediate tool results stay local to this tool run and are not sent back to the model unless you include them in the final output.
 - Prefer compact JSON summaries over raw dumps.
+${dockerBehavior}
 
 Prefer these patterns:
-- Many file reads from explicit paths: ptc.read_many(paths, limit=...)
-- Find and read an entire tree: ptc.read_tree(pattern=..., path=..., concurrency=...)
+- Many file reads from explicit paths: ptc.read_many(paths, max_concurrency=...)
+- Find and read an entire tree: ptc.read_tree(pattern=..., path=..., max_files=..., concurrency=...)
 - Bounded concurrency for arbitrary coroutines: ptc.gather_limit(coros, limit=...)
 - Relative file discovery: glob(...) or ptc.find_files(...)
 - Absolute file discovery for later read()/write(): ptc.find_files_abs(...)
 
 Python helpers currently available in this session:
-- read(path, file_path=None, offset=None, limit=None) -> str
-- glob(pattern, path='.', limit=1000) -> list[str]
-- find(pattern, path='.', limit=1000) -> list[str]
-- grep(...) -> list[dict]
-- ls(path='.', limit=500) -> list[str]
+- ${callableHelperLines.join("\n- ")}
 - ptc.gather_limit(coros, limit=...) -> list
-- ptc.read_many(paths, limit=..., offset=None, line_limit=None) -> list[str]
-- ptc.read_tree(pattern=..., path='.', limit=1000, concurrency=..., offset=None, line_limit=None) -> list[dict]
-- ptc.find_files(...), ptc.find_files_abs(...), ptc.read_text(...), ptc.json_dump(...)
+- ptc.read_many(paths, max_concurrency=..., offset=None, line_limit=None) -> list[str]
+- ptc.read_tree(pattern=..., path='.', max_files=1000, concurrency=..., offset=None, line_limit=None) -> list[dict]
+- ptc.find_files(pattern='**/*', path='.', max_files=1000) -> list[str]
+- ptc.find_files_abs(pattern='**/*', path='.', max_files=1000) -> list[str]
+- ptc.read_text(path, offset=None, limit=None) -> str
+- ptc.json_dump(value) -> str
 
 Callable tool set for this session: ${callable}
 
 Example:
 
-entries = await ptc.read_tree(pattern="**/*.ts", path="src", concurrency=6)
+entries = await ptc.read_tree(pattern="**/*.ts", path="src", max_files=1000, concurrency=6)
 return {
   "files": len(entries),
   "sample_lengths": [len(entry["content"]) for entry in entries[:3]],
 }`;
 }
-
 
 function getExtensionRoot(): string {
   return __dirname.endsWith("/dist") || __dirname.endsWith("\\dist")
@@ -116,30 +109,15 @@ function getExtensionRoot(): string {
     : __dirname;
 }
 
-async function registerLoadedTools(pi: ExtensionAPI, extensionRoot: string): Promise<Map<string, string>> {
-  const loadedTools = await loadTools(extensionRoot);
-  const initialFileMap = new Map<string, string>();
-
-  for (const { tool, filename } of loadedTools) {
-    pi.registerTool({
-      name: tool.name,
-      label: tool.label || tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-      execute: tool.execute,
-      ptc: tool.ptc,
-    } as PtcToolDefinition);
-    initialFileMap.set(filename, tool.name);
-  }
-
-  return initialFileMap;
-}
-
-function buildCodeExecutionTool(): PtcToolDefinition {
+function buildCodeExecutionTool(
+  currentSettings: PtcSettings,
+  callableTools: ToolInfo[],
+  codeExecutor: CodeExecutor
+): PtcToolDefinition {
   return {
     name: "code_execution",
     label: "Code Execution",
-    description: buildToolDescription(settings as PtcSettings),
+    description: buildToolDescription(currentSettings, callableTools),
     parameters: Type.Object({
       code: Type.String({
         description:
@@ -147,26 +125,18 @@ function buildCodeExecutionTool(): PtcToolDefinition {
       }),
     }),
     execute: async (toolCallId, { code }, signal, onUpdate, ctx) => {
-      if (!codeExecutor) {
-        throw new Error("Code executor not initialized");
-      }
+      const result = await codeExecutor.execute(code, {
+        cwd: ctx.cwd,
+        ctx,
+        signal,
+        onUpdate,
+        parentToolCallId: toolCallId,
+      });
 
-      try {
-        const result = await codeExecutor.execute(code, {
-          cwd: ctx.cwd,
-          signal,
-          onUpdate,
-          parentToolCallId: toolCallId,
-        });
-
-        return {
-          content: [{ type: "text" as const, text: result.output || "(No output)" }],
-          details: result.details,
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Python execution failed: ${message}`);
-      }
+      return {
+        content: [{ type: "text" as const, text: result.output || "(No output)" }],
+        details: result.details,
+      };
     },
     renderResult(result, { isPartial }, theme) {
       const details = result.details as ExecutionDetails | undefined;
@@ -189,34 +159,91 @@ function buildCodeExecutionTool(): PtcToolDefinition {
   };
 }
 
-async function cleanupSessionResources(): Promise<void> {
-  if (toolWatcher) {
-    toolWatcher.close();
-    toolWatcher = null;
-  }
-  if (sandboxManager) {
-    await sandboxManager.cleanup();
-    sandboxManager = null;
-  }
-  codeExecutor = null;
-  toolRegistry = null;
-  settings = null;
+interface PtcSessionState {
+  currentCwd: string;
+  customToolsStarted: boolean;
 }
 
-/**
- * PTC (Programmatic Tool Calling) extension.
- */
-export default async function ptcExtension(pi: ExtensionAPI, context: ExtensionContext) {
-  settings = loadSettingsFromEnv();
+function registerCodeExecutionTool(
+  pi: ExtensionAPI,
+  toolRegistry: ToolRegistry,
+  settings: PtcSettings,
+  codeExecutor: CodeExecutor,
+  currentCwd: string
+): void {
+  const callableTools = toolRegistry.getCallableTools(currentCwd, settings);
+  pi.registerTool(buildCodeExecutionTool(settings, callableTools, codeExecutor));
+}
+
+function registerCodeExecutionToolForState(
+  pi: ExtensionAPI,
+  toolRegistry: ToolRegistry,
+  settings: PtcSettings,
+  codeExecutor: CodeExecutor,
+  sessionState: PtcSessionState
+): void {
+  registerCodeExecutionTool(pi, toolRegistry, settings, codeExecutor, sessionState.currentCwd);
+}
+
+async function handleSessionStart(
+  customToolManager: CustomToolManager,
+  sessionState: PtcSessionState,
+  pi: ExtensionAPI,
+  toolRegistry: ToolRegistry,
+  settings: PtcSettings,
+  codeExecutor: CodeExecutor,
+  _event: unknown,
+  ctx: ExtensionContext
+): Promise<void> {
+  sessionState.currentCwd = ctx.cwd;
+  if (!sessionState.customToolsStarted) {
+    await customToolManager.start();
+    sessionState.customToolsStarted = true;
+  }
+
+  registerCodeExecutionTool(pi, toolRegistry, settings, codeExecutor, sessionState.currentCwd);
+}
+
+async function handleSessionShutdown(
+  customToolManager: CustomToolManager,
+  sandboxManager: SandboxManager
+): Promise<void> {
+  customToolManager.close();
+  await sandboxManager.cleanup();
+}
+
+export default async function ptcExtension(pi: ExtensionAPI, context?: ExtensionContext) {
+  const settings = loadSettingsFromEnv();
   const extensionRoot = getExtensionRoot();
+  const toolRegistry = new ToolRegistry(pi);
+  const sandboxManager = await createSandbox(settings);
+  const codeExecutor = new CodeExecutor(sandboxManager, toolRegistry, settings, extensionRoot);
+  const sessionState: PtcSessionState = {
+    currentCwd: context?.cwd ?? process.cwd(),
+    customToolsStarted: false,
+  };
 
-  toolRegistry = new ToolRegistry(pi);
-  sandboxManager = await createSandbox();
-  codeExecutor = new CodeExecutor(sandboxManager, toolRegistry, context, settings, extensionRoot);
+  const onToolSetChanged = registerCodeExecutionToolForState.bind(
+    undefined,
+    pi,
+    toolRegistry,
+    settings,
+    codeExecutor,
+    sessionState
+  );
+  const customToolManager = new CustomToolManager(extensionRoot, pi, toolRegistry, onToolSetChanged);
 
-  const initialFileMap = await registerLoadedTools(pi, extensionRoot);
-  toolWatcher = watchTools(extensionRoot, pi, toolRegistry, initialFileMap);
-  pi.registerTool(buildCodeExecutionTool());
+  const onSessionStart = handleSessionStart.bind(
+    undefined,
+    customToolManager,
+    sessionState,
+    pi,
+    toolRegistry,
+    settings,
+    codeExecutor
+  );
+  const onSessionShutdown = handleSessionShutdown.bind(undefined, customToolManager, sandboxManager);
 
-  pi.on("session_shutdown", cleanupSessionResources);
+  pi.on("session_start", onSessionStart);
+  pi.on("session_shutdown", onSessionShutdown);
 }

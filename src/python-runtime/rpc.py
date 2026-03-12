@@ -3,8 +3,21 @@ import json
 import sys
 from typing import Any, Dict, Optional
 
+
+class ToolCallError(Exception):
+    def __init__(self, payload: Dict[str, Any]):
+        self.payload = payload
+        message = str(payload.get("message") or "Tool call failed")
+        stack = payload.get("stack")
+        formatted = f"{message}\n{stack}" if isinstance(stack, str) and stack else message
+        super().__init__(formatted)
+
+
+class RpcProtocolError(Exception):
+    pass
+
+
 class RpcClient:
-    """RPC client for calling tools from Python code."""
 
     def __init__(self):
         self.call_id = 0
@@ -12,11 +25,15 @@ class RpcClient:
         self.reader_task: Optional[asyncio.Task[Any]] = None
 
     async def start_reader(self) -> None:
-        """Start background task to read responses from stdin."""
         self.reader_task = asyncio.create_task(self._stdin_reader())
 
+    def _fail_pending_calls(self, error: Exception) -> None:
+        for future in self.pending_calls.values():
+            if not future.done():
+                future.set_exception(error)
+        self.pending_calls.clear()
+
     async def _stdin_reader(self) -> None:
-        """Read responses from stdin and dispatch them to pending calls."""
         try:
             loop = asyncio.get_event_loop()
             reader = asyncio.StreamReader()
@@ -32,12 +49,13 @@ class RpcClient:
                     response = json.loads(line.decode().strip())
                     self._handle_response(response)
                 except json.JSONDecodeError as error:
-                    print(f"JSON decode error: {error}", file=sys.stderr)
+                    raise RpcProtocolError(f"JSON decode error: {error}") from error
                 except Exception as error:
-                    print(f"Error handling response: {error}", file=sys.stderr)
+                    raise RpcProtocolError(f"Error handling response: {error}") from error
         except asyncio.CancelledError:
             pass
         except Exception as error:
+            self._fail_pending_calls(error if isinstance(error, Exception) else RpcProtocolError(str(error)))
             print(f"stdin reader error: {error}", file=sys.stderr)
 
     def _handle_response(self, response: Dict[str, Any]) -> None:
@@ -45,8 +63,11 @@ class RpcClient:
         if call_id and call_id in self.pending_calls:
             future = self.pending_calls[call_id]
             if not future.done():
-                if response.get("error"):
-                    future.set_exception(Exception(response["error"]))
+                error = response.get("error")
+                if isinstance(error, dict):
+                    future.set_exception(ToolCallError(error))
+                elif error:
+                    future.set_exception(Exception(str(error)))
                 else:
                     future.set_result(response.get("value"))
             del self.pending_calls[call_id]
@@ -60,7 +81,11 @@ class RpcClient:
             "tool": tool,
             "params": params,
         }
-        print(json.dumps(request), flush=True)
+        protocol_write = globals().get("_ptc_protocol_write")
+        if callable(protocol_write):
+            protocol_write(request)
+        else:
+            print(json.dumps(request), flush=True)
 
         future: asyncio.Future[Any] = asyncio.Future()
         self.pending_calls[call_id] = future
@@ -80,8 +105,9 @@ class RpcClient:
             except asyncio.CancelledError:
                 pass
 
+
 _rpc = RpcClient()
 
+
 async def _rpc_call(tool: str, params: Dict[str, Any]) -> Any:
-    """Call a tool via RPC and return the JSON-compatible normalized value."""
     return await _rpc.call(tool, params)

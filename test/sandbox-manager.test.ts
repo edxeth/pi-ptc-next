@@ -19,11 +19,23 @@ function readStdout(proc) {
   });
 }
 
-test("createSandbox defaults to subprocess execution", async () => {
-  delete process.env.PTC_USE_DOCKER;
-  const sandbox = await createSandbox();
-  const proc = sandbox.spawn("print('hello from sandbox')", process.cwd());
+test("createSandbox allows subprocess execution only with explicit opt-in", async () => {
+  const settings = {
+    useDocker: false,
+    allowUnsandboxedSubprocess: true,
+  };
+  const sandbox = await createSandbox(settings);
+  const cwd = process.cwd();
+  const proc = sandbox.spawn("print('hello from sandbox')", cwd);
   const output = await readStdout(proc);
   assert.match(output, /hello from sandbox/);
+  assert.equal(sandbox.getRuntimeWorkspaceRoot(cwd), cwd);
   await sandbox.cleanup();
+});
+
+test("createSandbox rejects implicit unsandboxed subprocess mode", async () => {
+  await assert.rejects(
+    createSandbox({ useDocker: false, allowUnsandboxedSubprocess: false }),
+    /PTC requires a sandboxed runtime/
+  );
 });

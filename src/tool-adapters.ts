@@ -1,4 +1,4 @@
-import type { NormalizedToolResult } from "./types";
+import type { NormalizedToolResult } from "./contracts/execution-types";
 
 interface ToolExecutionResult {
   content?: Array<{ type?: string; text?: string } | Record<string, unknown>>;
@@ -135,17 +135,6 @@ export function normalizeToolResult(toolName: string, result: ToolExecutionResul
     }
 
     default:
-      if (text.length > 0) {
-        return { value: text, estimatedChars: text.length };
-      }
-
-      if (result.details !== undefined) {
-        return {
-          value: result.details,
-          estimatedChars: estimateChars(result.details),
-        };
-      }
-
-      return { value: null, estimatedChars: 0 };
+      return { value: text, estimatedChars: text.length };
   }
 }

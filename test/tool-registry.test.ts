@@ -1,14 +1,136 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
+const Module = require("node:module");
 
-test("tool-registry source includes callable policy and glob alias", () => {
-  const source = fs.readFileSync(path.join(__dirname, "..", "src", "tool-registry.ts"), "utf8");
+function createStubTool(name, description) {
+  return {
+    name,
+    description,
+    parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  };
+}
 
-  assert.match(source, /tool\.name === "code_execution"/);
-  assert.match(source, /builtins\.set\("glob"/);
-  assert.match(source, /return tool\.ptc\?\.enabled === true/);
-  assert.match(source, /allowMutations/);
-  assert.match(source, /allowBash/);
+function loadToolRegistryWithStubbedHost() {
+  const originalLoad = Module._load;
+  Module._load = function (request, parent, isMain) {
+    if (request === "@mariozechner/pi-coding-agent") {
+      return {
+        createReadTool: () => createStubTool("read", "read"),
+        createBashTool: () => createStubTool("bash", "bash"),
+        createEditTool: () => createStubTool("edit", "edit"),
+        createWriteTool: () => createStubTool("write", "write"),
+        createGrepTool: () => createStubTool("grep", "grep"),
+        createFindTool: () => createStubTool("find", "find"),
+        createLsTool: () => createStubTool("ls", "ls"),
+      };
+    }
+    return originalLoad(request, parent, isMain);
+  };
+
+  try {
+    delete require.cache[require.resolve("../dist/tool-registry.js")];
+    return require("../dist/tool-registry.js").ToolRegistry;
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
+function createRegistry() {
+  const ToolRegistry = loadToolRegistryWithStubbedHost();
+  const pi = {
+    getAllTools() {
+      return [];
+    },
+  };
+  return new ToolRegistry(pi);
+}
+
+function baseSettings(overrides = {}) {
+  return {
+    executionTimeoutMs: 1000,
+    maxOutputChars: 1000,
+    allowMutations: false,
+    allowBash: false,
+    maxParallelToolCalls: 4,
+    useDocker: false,
+    allowUnsandboxedSubprocess: true,
+    debugLogging: false,
+    trustedReadOnlyTools: undefined,
+    callableTools: undefined,
+    blockedTools: undefined,
+    ...overrides,
+  };
+}
+
+function stringParamSchema() {
+  return {
+    type: "object",
+    properties: {
+      value: { type: "string" },
+    },
+    required: ["value"],
+  };
+}
+
+test("ToolRegistry blocks untrusted custom read-only tools when mutations are disabled", () => {
+  const registry = createRegistry();
+  registry.upsertTool({
+    name: "query_db",
+    description: "Query DB",
+    parameters: stringParamSchema(),
+    ptc: { enabled: true, readOnly: true },
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  });
+
+  const callable = registry.getCallableTools(process.cwd(), baseSettings());
+  const names = callable.map((tool) => tool.name);
+
+  assert.deepEqual(names.sort(), ["find", "glob", "grep", "ls", "read"]);
+});
+
+test("ToolRegistry allows trusted custom read-only tools when explicitly allowlisted", () => {
+  const registry = createRegistry();
+  registry.upsertTool({
+    name: "query_db",
+    description: "Query DB",
+    parameters: stringParamSchema(),
+    ptc: { enabled: true, readOnly: true, pythonName: "query_db_readonly" },
+    async execute() {
+      return { content: [{ type: "text", text: "ok" }], details: undefined };
+    },
+  });
+
+  const callable = registry.getCallableTools(
+    process.cwd(),
+    baseSettings({ trustedReadOnlyTools: ["query_db"] })
+  );
+
+  assert.ok(callable.some((tool) => tool.name === "query_db"));
+});
+
+test("ToolRegistry rejects duplicate python helper names", () => {
+  const registry = createRegistry();
+  const parameters = stringParamSchema();
+
+  for (const name of ["tool_a", "tool_b"]) {
+    registry.upsertTool({
+      name,
+      description: name,
+      parameters,
+      ptc: { enabled: true, readOnly: true, pythonName: "shared_name" },
+      async execute() {
+        return { content: [{ type: "text", text: "ok" }], details: undefined };
+      },
+    });
+  }
+
+  assert.throws(
+    () => registry.getCallableTools(process.cwd(), baseSettings({ trustedReadOnlyTools: ["tool_a", "tool_b"] })),
+    /Duplicate Python helper name/
+  );
 });

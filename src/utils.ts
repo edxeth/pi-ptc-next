@@ -1,9 +1,12 @@
-import type { PtcSettings } from "./types";
+import { formatWithOptions } from "util";
+import type { PtcSettings } from "./contracts/settings";
 
-const DEFAULT_MAX_OUTPUT_SIZE = 100_000; // 100KB max output
+const DEFAULT_MAX_OUTPUT_SIZE = 100_000;
 const DEFAULT_EXECUTION_TIMEOUT_MS = 270_000;
 const DEFAULT_MAX_PARALLEL_TOOL_CALLS = 8;
 const DEBUG_PREFIX = "[PTC]";
+
+let debugLoggingEnabled = false;
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) {
@@ -36,11 +39,8 @@ function parseListEnv(value: string | undefined): string[] | undefined {
   return items.length > 0 ? items : undefined;
 }
 
-/**
- * Load extension settings from environment variables.
- */
 export function loadSettingsFromEnv(): PtcSettings {
-  return {
+  const settings = {
     executionTimeoutMs: parsePositiveIntEnv(
       process.env.PTC_EXECUTION_TIMEOUT_MS,
       DEFAULT_EXECUTION_TIMEOUT_MS
@@ -52,14 +52,18 @@ export function loadSettingsFromEnv(): PtcSettings {
       process.env.PTC_MAX_PARALLEL_TOOL_CALLS,
       DEFAULT_MAX_PARALLEL_TOOL_CALLS
     ),
+    useDocker: parseBooleanEnv(process.env.PTC_USE_DOCKER, false),
+    allowUnsandboxedSubprocess: parseBooleanEnv(process.env.PTC_ALLOW_UNSANDBOXED_SUBPROCESS, false),
+    debugLogging: parseBooleanEnv(process.env.PTC_DEBUG, false),
+    trustedReadOnlyTools: parseListEnv(process.env.PTC_TRUSTED_READ_ONLY_TOOLS),
     callableTools: parseListEnv(process.env.PTC_CALLABLE_TOOLS),
     blockedTools: parseListEnv(process.env.PTC_BLOCKED_TOOLS),
-  };
+  } satisfies PtcSettings;
+
+  debugLoggingEnabled = settings.debugLogging;
+  return settings;
 }
 
-/**
- * Truncate output if it exceeds the maximum size.
- */
 export function truncateOutput(output: string, maxOutputChars: number = DEFAULT_MAX_OUTPUT_SIZE): string {
   if (output.length <= maxOutputChars) {
     return output;
@@ -70,9 +74,6 @@ export function truncateOutput(output: string, maxOutputChars: number = DEFAULT_
   return truncated + truncationNotice;
 }
 
-/**
- * Format a Python exception for display.
- */
 export function formatPythonError(message: string, traceback?: string): string {
   if (traceback) {
     return `Python execution error:\n${message}\n\nTraceback:\n${traceback}`;
@@ -80,16 +81,10 @@ export function formatPythonError(message: string, traceback?: string): string {
   return `Python execution error: ${message}`;
 }
 
-/**
- * Estimate tokens from text length for relative benchmarking.
- */
 export function estimateTokensFromChars(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
-/**
- * Detect a common model mistake before execution.
- */
 export function validateUserCode(userCode: string): void {
   if (/\basyncio\.run\s*\(/.test(userCode)) {
     throw new Error(
@@ -104,18 +99,20 @@ export function validateUserCode(userCode: string): void {
   }
 }
 
-function isDebugLoggingEnabled(): boolean {
-  return parseBooleanEnv(process.env.PTC_DEBUG, false);
+function formatLogMessage(message: string, args: unknown[]): string {
+  const suffix =
+    args.length > 0
+      ? ` ${args.map((arg) => formatWithOptions({ colors: false, depth: 4 }, arg)).join(" ")}`
+      : "";
+  return `${DEBUG_PREFIX} ${message}${suffix}`;
 }
 
 export function debugLog(message: string, ...args: unknown[]): void {
-  if (isDebugLoggingEnabled()) {
-    console.log(`${DEBUG_PREFIX} ${message}`, ...args);
+  if (debugLoggingEnabled) {
+    process.stdout.write(`${formatLogMessage(message, args)}\n`);
   }
 }
 
-export function debugWarn(message: string, ...args: unknown[]): void {
-  if (isDebugLoggingEnabled()) {
-    console.warn(`${DEBUG_PREFIX} ${message}`, ...args);
-  }
+export function logWarning(message: string, ...args: unknown[]): void {
+  process.emitWarning(formatLogMessage(message, args), { code: "PTC" });
 }

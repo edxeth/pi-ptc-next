@@ -1,38 +1,32 @@
 import { randomUUID } from "crypto";
-import { spawn, exec, execSync } from "child_process";
-import { promisify } from "util";
-import type { SandboxManager } from "./types";
-import { debugLog, debugWarn } from "./utils";
+import { execSync, spawn } from "child_process";
+import type { SandboxManager } from "./contracts/execution-types";
+import type { PtcSettings } from "./contracts/settings";
+import { debugLog } from "./utils";
 
-const execAsync = promisify(exec);
+const EXECUTION_TIMEOUT = 270_000;
+const DOCKER_WORKSPACE_ROOT = "/workspace";
 
-const EXECUTION_TIMEOUT = 270_000; // 4.5 minutes in milliseconds
-
-/**
- * Subprocess-based sandbox implementation
- * Executes Python code in a local subprocess
- */
 class SubprocessSandbox implements SandboxManager {
   spawn(code: string, cwd: string): import("child_process").ChildProcess {
-    // Spawn Python process with unbuffered output
     return spawn("python3", ["-u", "-c", code], {
       cwd,
       env: { ...process.env },
     });
   }
 
-  async cleanup(): Promise<void> {
-    // No persistent resources to clean up
+  getRuntimeWorkspaceRoot(cwd: string): string {
+    return cwd;
+  }
+
+  cleanup(): Promise<void> {
+    return Promise.resolve();
   }
 }
 
-/**
- * Docker-based sandbox implementation
- * Executes Python code in an isolated Docker container
- */
 class DockerSandbox implements SandboxManager {
   private containerId: string | null = null;
-  private lastUsed: number = 0;
+  private lastUsed = 0;
   private readonly sessionId: string;
   private cleanupInterval: NodeJS.Timeout | null = null;
 
@@ -41,28 +35,32 @@ class DockerSandbox implements SandboxManager {
     this.startCleanupTimer();
   }
 
-  private startCleanupTimer() {
-    // Check every 60 seconds for expired containers
+  private startCleanupTimer(): void {
     this.cleanupInterval = setInterval(() => {
-      this.cleanupExpired();
+      try {
+        this.cleanupExpired();
+      } catch {
+        // Best-effort cleanup only.
+      }
     }, 60_000);
   }
 
-  private async cleanupExpired() {
+  private cleanupExpired(): void {
     if (this.containerId && Date.now() - this.lastUsed > EXECUTION_TIMEOUT) {
-      await this.stopContainer();
+      this.stopContainerNow();
     }
   }
 
-
-  private async stopContainer() {
-    if (!this.containerId) return;
+  private stopContainerNow(): void {
+    if (!this.containerId) {
+      return;
+    }
 
     const containerId = this.containerId;
     this.containerId = null;
 
     try {
-      await execAsync(`docker stop ${containerId}`);
+      execSync(`docker stop ${containerId}`, { stdio: "ignore" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("No such container") || message.includes("is not running")) {
@@ -72,84 +70,88 @@ class DockerSandbox implements SandboxManager {
     }
   }
 
+  private ensureContainer(cwd: string): void {
+    if (this.containerId && Date.now() - this.lastUsed <= EXECUTION_TIMEOUT) {
+      return;
+    }
+
+    this.stopContainerNow();
+
+    const containerName = `pi-ptc-${this.sessionId}-${Date.now()}`;
+    const output = execSync(
+      `docker run -d --rm --network none --name ${containerName} ` +
+      `-v "${cwd}:${DOCKER_WORKSPACE_ROOT}:ro" ` +
+      `-w ${DOCKER_WORKSPACE_ROOT} ` +
+      `--memory 512m --cpus 1.0 ` +
+      `python:3.12-slim tail -f /dev/null`,
+      { encoding: "utf-8" }
+    );
+    this.containerId = output.trim();
+  }
+
   spawn(code: string, cwd: string): import("child_process").ChildProcess {
     try {
-      // Check if we need to create a new container
-      if (!this.containerId || Date.now() - this.lastUsed > EXECUTION_TIMEOUT) {
-        // Stop old container if it exists
-        if (this.containerId) {
-          try {
-            execSync(`docker stop ${this.containerId}`, { stdio: "ignore" });
-          } catch {
-            // Container might already be stopped
-          }
-          this.containerId = null;
-        }
-
-        // Create new container
-        const containerName = `pi-ptc-${this.sessionId}-${Date.now()}`;
-        const output = execSync(
-          `docker run -d --rm --network none --name ${containerName} ` +
-          `-v "${cwd}:/workspace:ro" ` +
-          `--memory 512m --cpus 1.0 ` +
-          `python:3.12-slim tail -f /dev/null`,
-          { encoding: "utf-8" }
-        );
-        this.containerId = output.trim();
-      }
-
+      this.ensureContainer(cwd);
       this.lastUsed = Date.now();
 
-      // Execute Python code in container
-      return spawn("docker", ["exec", "-i", this.containerId, "python3", "-u", "-c", code], {
-        cwd,
-      });
+      return spawn("docker", [
+        "exec",
+        "-i",
+        "-w",
+        DOCKER_WORKSPACE_ROOT,
+        this.containerId as string,
+        "python3",
+        "-u",
+        "-c",
+        code,
+      ]);
     } catch (error) {
-      throw new Error(
-        `Failed to create/use Docker container: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to create/use Docker container: ${message}`);
     }
   }
 
-  async cleanup(): Promise<void> {
+  getRuntimeWorkspaceRoot(_cwd: string): string {
+    return DOCKER_WORKSPACE_ROOT;
+  }
+
+  cleanup(): Promise<void> {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
-    await this.stopContainer();
+    this.stopContainerNow();
+    return Promise.resolve();
   }
 }
 
-/**
- * Check if Docker is available on the system
- */
-async function isDockerAvailable(): Promise<boolean> {
+function isDockerAvailable(): boolean {
   try {
-    await execAsync("docker --version");
+    execSync("docker --version", { stdio: "ignore" });
     return true;
   } catch {
     return false;
   }
 }
 
-/**
- * Create a sandbox manager (uses subprocess by default, Docker opt-in via PTC_USE_DOCKER=true)
- */
-export async function createSandbox(): Promise<SandboxManager> {
-  const sessionId = randomUUID();
-  const useDocker = process.env.PTC_USE_DOCKER === "true";
-
-  if (useDocker) {
-    const dockerAvailable = await isDockerAvailable();
-    if (dockerAvailable) {
-      debugLog("Using Docker sandbox (PTC_USE_DOCKER=true)");
-      return new DockerSandbox(sessionId);
-    } else {
-      debugWarn("Docker requested but not available, falling back to subprocess sandbox");
-      return new SubprocessSandbox();
+export function createSandbox(settings: PtcSettings): Promise<SandboxManager> {
+  if (settings.useDocker) {
+    if (!isDockerAvailable()) {
+      return Promise.reject(new Error("PTC_USE_DOCKER=true but Docker is not available on this system."));
     }
-  } else {
-    debugLog("Using subprocess sandbox (default)");
-    return new SubprocessSandbox();
+
+    debugLog("Using Docker sandbox (PTC_USE_DOCKER=true)");
+    return Promise.resolve(new DockerSandbox(randomUUID()));
   }
+
+  if (!settings.allowUnsandboxedSubprocess) {
+    return Promise.reject(
+      new Error(
+        "PTC requires a sandboxed runtime. Set PTC_USE_DOCKER=true or explicitly opt into local subprocess mode with PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true."
+      )
+    );
+  }
+
+  debugLog("Using subprocess sandbox (PTC_ALLOW_UNSANDBOXED_SUBPROCESS=true)");
+  return Promise.resolve(new SubprocessSandbox());
 }
