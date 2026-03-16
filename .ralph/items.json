@@ -20,7 +20,7 @@
         "Verify unrelated SyntaxError and NameError inputs classify to null.",
         "Verify each supported failure class maps to one stable, minimal recovery prompt."
       ],
-      "passes": false,
+      "passes": true,
       "regression_notes": ""
     },
     {
