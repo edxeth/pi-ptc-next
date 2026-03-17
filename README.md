@@ -78,7 +78,9 @@ This implementation now focuses on provider-agnostic reliability:
 - Added bounded concurrency helper utilities in Python
 - Added `ptc.read_tree(...)` for deterministic find+read workflows
 - Added bounded async-only auto-recovery for common first-attempt async wrapper mistakes
+- Added ephemeral request telemetry for routing, first-path, recovery count, and terminal state in successful `code_execution` details
 - Added deterministic JSON eval cases and a local benchmark runner for routing/recovery checks
+- Added regression coverage for mutation-prompt exclusion, one-shot recovery limits, and per-request state reset
 
 ## Available Python functions
 
@@ -401,6 +403,25 @@ Useful flags:
 - `--timestamp <iso>` for deterministic output paths in CI or local comparisons
 
 Each result record includes at least `case_id`, `observed_first_path`, `success`, `recovery_attempted`, `failure_class`, `total_tokens`, and `duration_ms`.
+
+Successful `code_execution` runs also expose additive request metadata in tool result details:
+
+```json
+{
+  "telemetry": {
+    "autoRouted": false,
+    "firstToolPath": "code_execution",
+    "codeExecutionAttempts": 2,
+    "recoveryAttemptCount": 1,
+    "terminalState": "success"
+  },
+  "recovery": {
+    "eligible": true,
+    "attempted": true,
+    "failureClass": "missing-await"
+  }
+}
+```
 
 ## Further reading
 
